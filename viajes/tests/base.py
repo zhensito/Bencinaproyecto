@@ -20,17 +20,33 @@ def cargar_muestra():
 
 
 class RespuestaFalsa:
-    def __init__(self, datos=None, status=200, json_invalido=False):
-        self._datos, self.status_code, self._json_invalido = datos, status, json_invalido
+    """Respuesta de requests (con stream=True): el cuerpo se lee por trozos con iter_content."""
+
+    def __init__(self, datos=None, status=200, json_invalido=False, cuerpo=None, headers=None):
+        self._datos, self.status_code, self._json_invalido, self._cuerpo = datos, status, json_invalido, cuerpo
+        self.headers = headers or {}
+        self.text = None  # si se fija, es lo que "llega" como cuerpo
 
     def raise_for_status(self):
         if self.status_code >= 400:
             raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
 
-    def json(self):
+    def _bytes(self):
+        if self._cuerpo is not None:
+            return self._cuerpo
+        if self.text is not None:
+            return self.text.encode()
         if self._json_invalido:
-            raise ValueError("no es JSON")
-        return self._datos
+            return b"<html>no es JSON</html>"
+        return json.dumps(self._datos).encode()
+
+    def iter_content(self, chunk_size=1):
+        cuerpo = self._bytes()
+        for i in range(0, len(cuerpo), chunk_size):
+            yield cuerpo[i:i + chunk_size]
+
+    def close(self):
+        pass
 
 
 def api_falsa(muestra=None):

@@ -97,8 +97,10 @@ La estación que viene repetida en la respuesta de la API (mismo `id`) se cuenta
 ## Cómo se manejan los datos
 
 - `viajes/bencina.py` consulta y normaliza la API; `viajes/views.py` solo usa el resultado.
-- **Caché de 1 hora** (en archivo, dentro de `.cache_bencina/`). Si una consulta falla no se reintenta durante 60 s.
+- **Caché de 1 hora** (en archivo, en `.cache_bencina/cache_django/`, separada del respaldo: limpiar la caché de Django no toca los respaldos). Si una consulta falla no se reintenta durante 60 s.
 - **Respaldo permanente** (`.cache_bencina/respaldo.json`, más `respaldo.previo.json` con la copia anterior). Cada descarga válida lo reescribe de forma atómica (archivo temporal y cambio de nombre, así nunca queda a medias) y **no caduca**: sobrevive a reinicios de Django y del equipo. Guarda la hora de la descarga, si fue completa o parcial y el estado de cada endpoint, las **respuestas originales** de la API (estaciones y marcas) y los **datos normalizados** que usa la aplicación. Además de 93, 95 y 97, conserva todos los combustibles que entrega la API (DI, KE, GNC, A93, A95, A97, ADI…) con su nombre largo, unidad de cobro, fecha y tipo de atención, y cualquier otro campo que venga en cada estación. El recomendador sigue usando solo 93, 95 y 97.
+- **Límite de tamaño.** Cada respuesta de la API se lee por trozos y se cuentan los bytes realmente recibidos (ya descomprimidos); si pasan de `BENCINA_MAX_BYTES` (25 MB por defecto) se rechaza sin interpretarla como JSON y el respaldo no cambia. Se mantienen el tiempo de espera y la verificación TLS.
+- **Escrituras.** Cada guardado usa archivos temporales de nombre único y `os.replace` (atómico); si dos procesos guardan a la vez, gana el último y el otro queda como copia previa. Los temporales abandonados por una caída se limpian al cabo de una hora.
 - **Protección del respaldo.** Una descarga no reemplaza la copia buena si trae menos de 10 estaciones, si menos de la mitad tiene precios o si pierde más de la mitad de las estaciones (o de las estaciones con precio) de la copia anterior; en ese caso se conserva la copia y el aviso dice por qué. Si falla solo el endpoint de marcas, se reutilizan las de la descarga anterior y la descarga queda marcada como parcial. Un JSON corrupto o ilegible se ignora (se prueba con la copia anterior) sin borrarlo y sin provocar un error 500.
 - **Cuando la API no responde** se muestran los datos guardados con la etiqueta «Datos guardados, no son precios actuales» y la fecha de su última descarga, por antiguos que sean (no se vuelven a filtrar por antigüedad). Sin ninguna copia, la página lo dice y no inventa datos.
 - Se descartan precios fuera de $500–$2.500/L y precios con más de 30 días; las coordenadas con coma decimal se interpretan y las que caen fuera de Chile se ignoran (esa estación queda en la lista, sin marcador). «A93» (asistido) y «93» (autoservicio) se juntan en un solo combustible, con el precio más bajo.
@@ -110,9 +112,10 @@ Variables de entorno opcionales:
 |---|---|---|
 | `BENCINA_API_BASE` | `https://api.bencinaenlinea.cl/api` | URL base de la API |
 | `BENCINA_TIMEOUT` | `15` | Segundos de espera por consulta |
-| `BENCINA_VERIFICAR_TLS` | `1` | Con `0` no se verifica el certificado TLS de la API (solo si su certificado está vencido o mal configurado); la página avisa que la conexión no está verificada |
+| `BENCINA_VERIFICAR_TLS` | `1` | La verificación TLS está siempre activa por defecto y nunca se desactiva sola. `0` existe solo como **diagnóstico puntual** (la página avisa que la conexión no está verificada) y **no se permite en producción** |
 | `BENCINA_CACHE_SEGUNDOS` | `3600` | Duración de la caché fresca (el respaldo permanente no caduca) |
-| `BENCINA_CACHE_DIR` | `.cache_bencina` | Carpeta de la caché y del respaldo permanente |
+| `BENCINA_CACHE_DIR` | `.cache_bencina` | Carpeta del respaldo permanente (la caché de Django va en su subcarpeta `cache_django`) |
+| `BENCINA_MAX_BYTES` | `26214400` | Tamaño máximo (bytes) de una respuesta de la API |
 | `BENCINA_MAX_DIAS` | `30` | Antigüedad máxima de un precio |
 | `BENCINA_JSON_LOCAL` | vacío | Leer un archivo en vez de la API |
 
@@ -136,7 +139,7 @@ Cómo se verificó el trabajo de la IA: 67 pruebas automáticas (`python manage.
 python manage.py test
 ```
 
-103 pruebas (normalización, selector de marca y modelo, catálogo referencial, caché, errores de red, recomendador, calculadora, filtros y endpoint del mapa). Usan una muestra real guardada en `viajes/tests/fixtures/`, no consultan internet.
+118 pruebas (normalización, selector de marca y modelo, catálogo referencial, caché, errores de red, recomendador, calculadora, filtros y endpoint del mapa). Usan una muestra real guardada en `viajes/tests/fixtures/`, no consultan internet.
 
 ## Catálogo ampliado (datos referenciales)
 
@@ -174,3 +177,19 @@ Cómo se usan:
 - Leaflet se carga desde un CDN: sin internet el mapa no aparece (el recomendador y la calculadora sí funcionan).
 - Las animaciones y la apariencia se probaron en Chromium; no se probó en otros navegadores.
 - `SECRET_KEY` y `DEBUG` son de desarrollo (`config/settings.py`). Para un despliegue público hay que cambiarlos.
+
+## Publicar el proyecto (producción)
+
+En local no hace falta configurar nada (`DEBUG` activo, clave de desarrollo). Para publicarlo hay que definir `DJANGO_DEBUG=0`; entonces Django **no arranca** si falta algo de lo siguiente:
+
+| Variable | Obligatoria | Uso |
+|---|---|---|
+| `DJANGO_DEBUG=0` | sí | Activa el modo producción |
+| `DJANGO_SECRET_KEY` | sí | Clave propia y secreta, de al menos 50 caracteres (no la de desarrollo) |
+| `DJANGO_ALLOWED_HOSTS` | sí | Dominios del sitio separados por comas, sin `*` |
+| `DJANGO_SSL_REDIRECT` | no (`1`) | `0` desactiva la redirección a HTTPS |
+| `DJANGO_HSTS_SEGUNDOS` | no (`0`) | Súbalo (p. ej. `31536000`) cuando HTTPS ya funcione |
+| `DJANGO_PROXY_SSL=1` | solo con proxy | Confía en `X-Forwarded-Proto` de un proxy de confianza |
+| `DJANGO_CSRF_ORIGINS` | si hace falta | Orígenes `https://…` de confianza para CSRF |
+
+En producción también se activan las cookies de sesión y CSRF seguras. Antes de publicar, ejecute `DJANGO_DEBUG=0 … python manage.py check --deploy` (con las variables anteriores); solo quedará el aviso de HSTS mientras `DJANGO_HSTS_SEGUNDOS` sea 0. `.cache_bencina/` está en la raíz del proyecto, fuera de las carpetas estáticas, por lo que el servidor no la expone; no la mueva a una carpeta servida. Los archivos estáticos hay que servirlos con el servidor web (el proyecto no define `STATIC_ROOT`).

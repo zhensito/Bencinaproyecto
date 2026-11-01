@@ -21,13 +21,35 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
+# Desarrollo local por defecto: no hace falta configurar nada para ejecutar `runserver`.
+# Para publicar, defina DJANGO_DEBUG=0 y las variables de producción (ver README): con DEBUG=0 se exige una configuración
+# explícita y segura, y si falta algo Django no arranca (en vez de quedar expuesto sin darse cuenta).
 SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-_3z8lk=ihhv-jhdt=&y-b(qxluv_02sj8u^%0^jb28j2jh+yak')
 
-# SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DJANGO_DEBUG', '1') != '0'
 
 ALLOWED_HOSTS = [h for h in os.environ.get('DJANGO_ALLOWED_HOSTS', '').split(',') if h]
+
+if not DEBUG:  # ---- producción ----
+    from django.core.exceptions import ImproperlyConfigured
+
+    _problemas = []
+    if SECRET_KEY.startswith('django-insecure-') or len(SECRET_KEY) < 50:
+        _problemas.append("DJANGO_SECRET_KEY debe ser propia, secreta y de al menos 50 caracteres")
+    if not ALLOWED_HOSTS or '*' in ALLOWED_HOSTS:
+        _problemas.append("DJANGO_ALLOWED_HOSTS debe listar los dominios del sitio (sin '*')")
+    if os.environ.get('BENCINA_VERIFICAR_TLS') == '0':
+        _problemas.append("BENCINA_VERIFICAR_TLS=0 (sin verificar el certificado de la API) no se permite en producción")
+    if _problemas:
+        raise ImproperlyConfigured("Configuración de producción incompleta: " + "; ".join(_problemas) + ".")
+
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_SSL_REDIRECT = os.environ.get('DJANGO_SSL_REDIRECT', '1') != '0'
+    SECURE_HSTS_SECONDS = int(os.environ.get('DJANGO_HSTS_SEGUNDOS', '0'))  # súbalo (p. ej. 31536000) cuando HTTPS ya funcione
+    if os.environ.get('DJANGO_PROXY_SSL') == '1':  # solo si hay un proxy de confianza que pone X-Forwarded-Proto
+        SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    CSRF_TRUSTED_ORIGINS = [o for o in os.environ.get('DJANGO_CSRF_ORIGINS', '').split(',') if o]
 
 
 # Application definition
@@ -125,7 +147,8 @@ STATIC_URL = 'static/'
 
 MAILERS = {
     'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+        # El proyecto no envía correos. En producción se usa el backend SMTP (el de consola es solo de desarrollo).
+        'BACKEND': 'django.core.mail.backends.console.EmailBackend' if DEBUG else 'django.core.mail.backends.smtp.EmailBackend',
     },
 }
 
@@ -141,6 +164,6 @@ else:
     CACHES = {
         "default": {
             "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
-            "LOCATION": BENCINA_RESPALDO_DIR,
+            "LOCATION": os.path.join(BENCINA_RESPALDO_DIR, "cache_django"),  # solo la caché de Django; los respaldos quedan fuera
         }
     }

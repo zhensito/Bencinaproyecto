@@ -469,3 +469,207 @@ class RespaldoJsonTests(ConCache):
         self.assertIn("No hay precios guardados", d.aviso)
         self.assertEqual(d.estaciones, [])
         self.assertFalse(bencina._ruta_respaldo().exists())  # no se inventa ni se crea nada
+
+
+class EndurecimientoTests(ConCache):
+    def bajar(self, muestra=None):
+        with mock.patch("viajes.bencina.requests.get", side_effect=api_falsa(muestra)):
+            return bencina.obtener_datos(forzar=True)
+
+    def caida(self, resp):
+        with mock.patch("viajes.bencina.requests.get", return_value=resp):
+            return bencina.obtener_datos(forzar=True)
+
+    # --- 1. caché de Django separada del respaldo ---
+    def test_la_cache_de_django_vive_en_su_propia_subcarpeta(self):
+        import runpy
+        import shutil
+        import sys
+        import tempfile
+
+        carpeta = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, carpeta, True)
+        with mock.patch.dict("os.environ", {"BENCINA_CACHE_DIR": carpeta, "DJANGO_DEBUG": "1"}), mock.patch.object(sys, "argv", ["manage.py", "runserver"]):
+            cfg = runpy.run_path("config/settings.py")
+        self.assertEqual(cfg["CACHES"]["default"]["LOCATION"], f"{carpeta}/cache_django")
+        self.assertEqual(cfg["BENCINA_RESPALDO_DIR"], carpeta)
+
+    def test_limpiar_la_cache_de_django_no_toca_los_respaldos(self):
+        from django.core.cache.backends.filebased import FileBasedCache
+
+        self.bajar(); self.bajar()  # respaldo.json y respaldo.previo.json
+        antes = {n: (self.carpeta / n).read_bytes() for n in ("respaldo.json", "respaldo.previo.json")}
+        for ubicacion in (self.carpeta / "cache_django", self.carpeta):  # también si alguien la apuntara a la misma carpeta
+            c = FileBasedCache(str(ubicacion), {"MAX_ENTRIES": 1, "CULL_FREQUENCY": 1})
+            for i in range(5):
+                c.set(f"k{i}", i, 60)  # fuerza la poda interna
+            c.clear()
+        self.assertEqual({n: (self.carpeta / n).read_bytes() for n in antes}, antes)
+
+    # --- 2. tamaño máximo ---
+    def test_respuesta_demasiado_grande_se_rechaza_sin_procesarla(self):
+        self.bajar()
+        antes = self.carpeta.joinpath("respaldo.json").read_bytes()
+        grande = json.dumps({"data": [{"id": i, "relleno": "x" * 50} for i in range(400)]}).encode()
+        with mock.patch("viajes.bencina.MAX_BYTES", 2000), mock.patch("viajes.bencina.json.loads", wraps=json.loads) as cargar_json:
+            d = self.caida(RespuestaFalsa(cuerpo=grande, headers={"Content-Length": "10"}))  # Content-Length miente
+            self.assertNotIn(grande, [c.args[0] for c in cargar_json.call_args_list])  # nunca se interpretó como JSON
+        self.assertEqual(d.fuente, "respaldo")
+        self.assertIn("límite", d.aviso)
+        self.assertEqual(self.carpeta.joinpath("respaldo.json").read_bytes(), antes)
+        with mock.patch("viajes.bencina.MAX_BYTES", 2000):  # y también si lo declara y sin Content-Length
+            self.assertIn("límite", self.caida(RespuestaFalsa(cuerpo=b"x", headers={"Content-Length": "999999"})).aviso)
+            self.assertIn("límite", self.caida(RespuestaFalsa(cuerpo=grande)).aviso)
+
+    def test_el_limite_por_defecto_deja_pasar_la_muestra_real(self):
+        self.assertGreaterEqual(bencina.MAX_BYTES, 10 * 1024 * 1024)
+        self.assertEqual(self.bajar().fuente, "api")
+
+    def test_json_cortado_o_invalido_no_reemplaza_el_respaldo(self):
+        self.bajar()
+        antes = self.carpeta.joinpath("respaldo.json").read_bytes()
+        completo = json.dumps(cargar_muestra()["estaciones"]).encode()
+        for cuerpo in (completo[: len(completo) // 2], b"", b"<html>", b"\xff\xfe\x00"):
+            self.assertEqual(self.caida(RespuestaFalsa(cuerpo=cuerpo)).fuente, "respaldo")
+            self.assertEqual(self.carpeta.joinpath("respaldo.json").read_bytes(), antes)
+
+    # --- 3. escrituras simultáneas y fallos ---
+    def test_escrituras_simultaneas_no_corrompen_el_respaldo(self):
+        import threading
+
+        self.bajar()
+        base = self.carpeta.joinpath("respaldo.json").read_bytes()
+        docs = []
+        for i in range(8):
+            d = json.loads(base)
+            d["descargado"] = f"2026-11-0{1 + i % 8}T12:00:00+00:00"
+            docs.append(d)
+        resultados = []
+        hilos = [threading.Thread(target=lambda d=d: resultados.append(bencina._guardar_respaldo(d))) for d in docs for _ in range(3)]
+        for h in hilos: h.start()
+        for h in hilos: h.join()
+        bencina._memo.clear()
+        for nombre in ("respaldo.json", "respaldo.previo.json"):
+            doc = json.loads(self.carpeta.joinpath(nombre).read_text(encoding="utf-8"))  # ambos son JSON completos y válidos
+            self.assertEqual(len(doc["estaciones"]), 35)
+        self.assertEqual([p.name for p in self.carpeta.iterdir() if p.name.startswith(".tmp")], [])
+        self.assertTrue(all(resultados))
+
+    def test_fallo_al_rotar_conserva_los_datos_y_no_deja_temporales(self):
+        self.bajar(); self.bajar()
+        antes = {n: self.carpeta.joinpath(n).read_bytes() for n in ("respaldo.json", "respaldo.previo.json")}
+        with mock.patch("viajes.bencina.shutil.copyfile", side_effect=OSError("disco lleno")):
+            d = self.bajar()
+        self.assertIn("No se pudo guardar", d.aviso)
+        self.assertEqual({n: self.carpeta.joinpath(n).read_bytes() for n in antes}, antes)
+        self.assertEqual([p.name for p in self.carpeta.iterdir() if p.name.startswith(".tmp")], [])
+
+    def test_temporales_abandonados_antiguos_se_limpian_y_los_recientes_no(self):
+        import os
+        import time
+
+        viejo, nuevo = self.carpeta / ".tmp-viejo.json", self.carpeta / ".tmp-nuevo.json"
+        viejo.write_text("x"); nuevo.write_text("x")
+        os.utime(viejo, (time.time() - 7200, time.time() - 7200))
+        self.bajar()
+        self.assertFalse(viejo.exists())
+        self.assertTrue(nuevo.exists())
+
+    # --- 4. ambos respaldos dañados: la página responde, sin error 500 ---
+    def test_con_ambos_respaldos_danados_la_pagina_no_da_500(self):
+        from django.test import Client
+
+        self.bajar(); self.bajar()
+        for n in ("respaldo.json", "respaldo.previo.json"):
+            self.carpeta.joinpath(n).write_text('{"version": 1, "estaciones": [', encoding="utf-8")
+        bencina._memo.clear(); bencina.cache.clear()
+        c = Client()
+        with mock.patch("viajes.bencina.requests.get", side_effect=requests.ConnectionError("sin red")):
+            r = c.post("/", {"accion": "recomendar", "vehiculo": "Kia Soluto 1.4", "km_mes": "1000"})
+            j = c.get("/estaciones.json")
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "No hay precios guardados")
+        self.assertEqual(j.status_code, 503)
+        self.assertEqual(c.post("/", {"accion": "repostaje", "litros": "40", "precio_litro": "1350"}).status_code, 200)
+
+    # --- TLS ---
+    def test_tls_verificado_por_defecto_y_un_error_de_certificado_no_se_salta(self):
+        import os
+
+        self.assertNotIn("BENCINA_VERIFICAR_TLS", os.environ)
+        self.assertTrue(bencina.VERIFICAR_TLS)
+        self.bajar()
+        antes = self.carpeta.joinpath("respaldo.json").read_bytes()
+        with mock.patch("viajes.bencina.requests.get", side_effect=requests.exceptions.SSLError("certificate has expired")) as get:
+            d = bencina.obtener_datos(forzar=True)
+        self.assertEqual(get.call_count, 1)  # no reintenta sin verificar
+        self.assertTrue(get.call_args.kwargs["verify"])
+        self.assertEqual(d.fuente, "respaldo")
+        self.assertIn("solo para un diagnóstico", d.aviso)
+        self.assertEqual(self.carpeta.joinpath("respaldo.json").read_bytes(), antes)
+
+    # --- mensajes sin credenciales ---
+    def test_los_mensajes_no_muestran_usuario_ni_clave_de_un_proxy(self):
+        err = requests.ConnectionError("ProxyError('http://usuario:secreta@proxy.local:8080')")
+        with mock.patch("viajes.bencina.requests.get", side_effect=err):
+            d = bencina.obtener_datos(forzar=True)
+        self.assertNotIn("secreta", d.aviso)
+        self.assertNotIn("usuario", d.aviso)
+
+
+class ConfiguracionDjangoTests(ConCache):
+    def cargar(self, **env):
+        import runpy
+        import shutil
+        import sys
+        import tempfile
+
+        carpeta = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, carpeta, True)
+        base = {"BENCINA_CACHE_DIR": carpeta}
+        for k in ("DJANGO_DEBUG", "DJANGO_SECRET_KEY", "DJANGO_ALLOWED_HOSTS", "BENCINA_VERIFICAR_TLS"):
+            base.setdefault(k, "")
+        base.update(env)
+        with mock.patch.dict("os.environ", base), mock.patch.object(sys, "argv", ["manage.py", "runserver"]):
+            import os
+            for k in [k for k, v in base.items() if v == "" and k.startswith(("DJANGO_", "BENCINA_VERIF"))]:
+                os.environ.pop(k, None)
+            return runpy.run_path("config/settings.py")
+
+    def test_el_desarrollo_local_arranca_sin_configurar_nada(self):
+        cfg = self.cargar()
+        self.assertTrue(cfg["DEBUG"])
+        self.assertEqual(cfg["ALLOWED_HOSTS"], [])
+        self.assertFalse(cfg.get("SESSION_COOKIE_SECURE", False))
+        self.assertFalse(cfg.get("SECURE_SSL_REDIRECT", False))
+
+    def test_produccion_exige_clave_hosts_y_tls(self):
+        from django.core.exceptions import ImproperlyConfigured
+
+        with self.assertRaises(ImproperlyConfigured) as e:
+            self.cargar(DJANGO_DEBUG="0")
+        self.assertIn("DJANGO_SECRET_KEY", str(e.exception))
+        self.assertIn("DJANGO_ALLOWED_HOSTS", str(e.exception))
+        clave = "k" * 60
+        with self.assertRaises(ImproperlyConfigured):
+            self.cargar(DJANGO_DEBUG="0", DJANGO_SECRET_KEY="django-insecure-" + "a" * 60, DJANGO_ALLOWED_HOSTS="ejemplo.cl")
+        with self.assertRaises(ImproperlyConfigured):
+            self.cargar(DJANGO_DEBUG="0", DJANGO_SECRET_KEY=clave, DJANGO_ALLOWED_HOSTS="*")
+        with self.assertRaises(ImproperlyConfigured) as e:
+            self.cargar(DJANGO_DEBUG="0", DJANGO_SECRET_KEY=clave, DJANGO_ALLOWED_HOSTS="ejemplo.cl", BENCINA_VERIFICAR_TLS="0")
+        self.assertIn("BENCINA_VERIFICAR_TLS", str(e.exception))
+
+    def test_produccion_valida_activa_las_medidas_seguras(self):
+        cfg = self.cargar(DJANGO_DEBUG="0", DJANGO_SECRET_KEY="k" * 60, DJANGO_ALLOWED_HOSTS="ejemplo.cl,www.ejemplo.cl", DJANGO_PROXY_SSL="1")
+        self.assertFalse(cfg["DEBUG"])
+        self.assertEqual(cfg["ALLOWED_HOSTS"], ["ejemplo.cl", "www.ejemplo.cl"])
+        self.assertTrue(cfg["SESSION_COOKIE_SECURE"] and cfg["CSRF_COOKIE_SECURE"] and cfg["SECURE_SSL_REDIRECT"])
+        self.assertEqual(cfg["SECURE_PROXY_SSL_HEADER"], ("HTTP_X_FORWARDED_PROTO", "https"))
+
+    def test_los_respaldos_y_la_cache_no_se_pueden_descargar_por_http(self):
+        from django.test import Client
+
+        self.carpeta.joinpath("respaldo.json").write_text("{}")
+        c = Client()
+        for ruta in ("/.cache_bencina/respaldo.json", "/respaldo.json", "/static/respaldo.json", "/static/../.cache_bencina/respaldo.json", "/media/respaldo.json"):
+            self.assertEqual(c.get(ruta).status_code, 404, ruta)
