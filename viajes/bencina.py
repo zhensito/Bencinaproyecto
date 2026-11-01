@@ -12,6 +12,7 @@ precios 93/95/97 que pasaron la validación (los demás se consideran "sin dato"
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import unicodedata
@@ -40,6 +41,7 @@ USER_AGENT = "proyectobencina/1.0 (proyecto universitario USM; uso ciudadano)"
 
 # Respaldo permanente: respaldo.json (y respaldo.previo.json con la copia anterior) dentro de la carpeta de la caché. No caduca.
 CARPETA_RESPALDO = Path(getattr(settings, "BENCINA_RESPALDO_DIR", ".cache_bencina"))
+MAX_BYTES = int(os.environ.get("BENCINA_MAX_BYTES", str(25 * 1024 * 1024)))  # tamaño máximo de una respuesta de la API (ya descomprimida)
 VERSION_RESPALDO = 1
 MIN_ESTACIONES = 10  # una descarga con menos estaciones que esto no se considera válida
 FRACCION_MIN = 0.5   # ni la que pierde más de la mitad de las estaciones (o de las estaciones con precio) de la copia anterior
@@ -208,29 +210,60 @@ def normalizar_respuesta(estaciones_json, marcas_json=None, ahora_=None):
 
 
 # ---------- obtención ----------
-def _muestra(resp, n=120):
+def _sin_credenciales(texto):
+    """Quita usuario y contraseña de las URL (p. ej. de un proxy) antes de mostrar o registrar un mensaje."""
+    return re.sub(r"(?<=://)[^/\s@]+@", "***@", str(texto))
+
+
+def _leer(resp, limite, truncar=False):
+    """Lee el cuerpo por trozos y cuenta los bytes realmente recibidos (no confía en Content-Length)."""
+    partes, total = [], 0
+    for trozo in resp.iter_content(65536):
+        total += len(trozo)
+        if total > limite:
+            if truncar:
+                partes.append(trozo[: limite - (total - len(trozo))])
+                break
+            raise ValueError(f"la respuesta supera el límite de {limite / (1024 * 1024):g} MB y se rechazó sin procesarla")
+        partes.append(trozo)
+    return b"".join(partes)
+
+
+def _muestra(datos, n=120):
     """Primeros caracteres de la respuesta, en una línea, para el registro de errores."""
-    return " ".join(str(getattr(resp, "text", "") or "")[:n].split())
+    return " ".join(datos[:n].decode("utf-8", "replace").split())
 
 
 def _get_json(ruta):
     """GET a la API de Bencina en Línea. Cuando falla, deja en el registro la URL, el código HTTP, el tipo de contenido
-    y el comienzo de la respuesta, para poder saber por qué (un bloqueo, una página de error y un cambio de formato se ven distinto)."""
+    y el comienzo de la respuesta, para poder saber por qué (un bloqueo, una página de error y un cambio de formato se ven distinto).
+    El cuerpo se limita a MAX_BYTES: si lo supera se rechaza sin interpretarlo como JSON."""
     url = f"{API_BASE}/{ruta}"
     resp = requests.get(
-        url, timeout=TIMEOUT, verify=VERIFICAR_TLS, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
+        url, timeout=TIMEOUT, verify=VERIFICAR_TLS, stream=True, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
     )
-    tipo = (getattr(resp, "headers", None) or {}).get("Content-Type", "?")
     try:
-        resp.raise_for_status()
-    except requests.HTTPError:
-        log.warning("HTTP %s en %s (content-type %s): %r", resp.status_code, url, tipo, _muestra(resp))
-        raise
-    try:
-        return resp.json()
-    except ValueError as e:
-        log.warning("Respuesta no JSON en %s (HTTP %s, content-type %s): %r", url, resp.status_code, tipo, _muestra(resp))
-        raise ValueError(f"{ruta} no devolvió JSON (HTTP {resp.status_code}, {tipo}): {_muestra(resp, 60)!r}") from e
+        tipo = (getattr(resp, "headers", None) or {}).get("Content-Type", "?")
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError:
+            log.warning("HTTP %s en %s (content-type %s): %r", resp.status_code, url, tipo, _muestra(_leer(resp, 200, truncar=True)))
+            raise
+        declarado = str((getattr(resp, "headers", None) or {}).get("Content-Length", ""))
+        if declarado.isdigit() and int(declarado) > MAX_BYTES:  # aviso temprano; el control real es el conteo de bytes
+            raise ValueError(f"{ruta}: la respuesta declara {int(declarado) / (1024 * 1024):g} MB, más que el límite de {MAX_BYTES / (1024 * 1024):g} MB")
+        try:
+            cuerpo = _leer(resp, MAX_BYTES)
+        except ValueError as e:
+            log.warning("%s: %s (%s)", url, e, tipo)
+            raise ValueError(f"{ruta}: {e}") from e
+        try:
+            return json.loads(cuerpo)
+        except ValueError as e:
+            log.warning("Respuesta no JSON en %s (HTTP %s, content-type %s): %r", url, resp.status_code, tipo, _muestra(cuerpo))
+            raise ValueError(f"{ruta} no devolvió JSON (HTTP {resp.status_code}, {tipo}): {_muestra(cuerpo, 60)!r}") from e
+    finally:
+        resp.close()
 
 
 def _descargar():
@@ -311,7 +344,7 @@ def _escribir_atomico(destino, contenido):
     """Escribe en un archivo temporal de la misma carpeta y lo cambia de nombre: el destino nunca queda a medias."""
     tmp = None
     try:
-        with tempfile.NamedTemporaryFile("w", dir=destino.parent, prefix=".tmp-", suffix=".json", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile("w", dir=destino.parent, prefix=".tmp-resp-", suffix=".json", delete=False, encoding="utf-8") as f:
             tmp = Path(f.name)
             f.write(contenido)
             f.flush()
@@ -323,22 +356,41 @@ def _escribir_atomico(destino, contenido):
         raise
 
 
+def _limpiar_temporales(carpeta, edad=3600):
+    """Borra solo los temporales (.tmp-*) abandonados hace más de `edad` segundos, p. ej. por un corte de luz a mitad de la escritura."""
+    limite = datetime.now().timestamp() - edad
+    for t in carpeta.glob(".tmp-*"):
+        try:
+            if t.stat().st_mtime < limite:
+                t.unlink()
+        except OSError:
+            pass
+
+
 def _guardar_respaldo(doc):
-    """Guarda `doc` como respaldo. La copia vigente (si es válida) pasa a respaldo.previo.json. True si quedó guardado."""
+    """Guarda `doc` como respaldo. La copia vigente (si es válida) pasa a respaldo.previo.json. True si quedó guardado.
+
+    Cada escritura usa archivos temporales de nombre único y se publica con os.replace (atómico), así que dos procesos o
+    solicitudes que guarden a la vez no pueden dejar un archivo a medias: gana la última y la otra queda como copia previa.
+    """
     tmp_prev = None
     try:
         CARPETA_RESPALDO.mkdir(parents=True, exist_ok=True)
+        _limpiar_temporales(CARPETA_RESPALDO)
         actual = _ruta_respaldo()
         if _cargar_respaldo(actual):  # solo se rota una copia válida: una dañada no pisa a la anterior
-            tmp_prev = actual.with_name(".tmp-previo.json")
-            shutil.copy2(actual, tmp_prev)
+            fd, nombre = tempfile.mkstemp(dir=CARPETA_RESPALDO, prefix=".tmp-previo-", suffix=".json")
+            os.close(fd)
+            tmp_prev = Path(nombre)
+            shutil.copyfile(actual, tmp_prev)
             os.replace(tmp_prev, _ruta_respaldo(previo=True))
+            tmp_prev = None
         _escribir_atomico(actual, json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
         return True
     except Exception as e:
         if tmp_prev is not None:
             tmp_prev.unlink(missing_ok=True)
-        log.error("No se pudo guardar el respaldo en %s: %s", CARPETA_RESPALDO, e)
+        log.error("No se pudo guardar el respaldo en %s: %s", CARPETA_RESPALDO, _sin_credenciales(e))
         return False
 
 
@@ -391,7 +443,8 @@ def obtener_datos(forzar=False):
     except requests.exceptions.SSLError as e:
         return _fallo(
             f"No se pudo verificar el certificado TLS de la API ({str(e)[-160:]}). Si el certificado del servidor está vencido o "
-            "mal configurado, la API no se puede usar con verificación; BENCINA_VERIFICAR_TLS=0 permite usarla sin verificar.", e)
+            "mal configurado, hay que esperar a que el proveedor lo corrija; BENCINA_VERIFICAR_TLS=0 existe solo para un diagnóstico puntual, "
+            "no es una solución.", e)
     except requests.ConnectionError as e:
         return _fallo(f"No se pudo conectar con Bencina en Línea ({type(e).__name__}: {str(e)[:150]}).", e)
     except requests.HTTPError as e:
@@ -432,7 +485,8 @@ def obtener_datos(forzar=False):
 
 
 def _fallo(mensaje, excepcion):
-    log.warning("%s (%s)", mensaje, excepcion)
+    mensaje = _sin_credenciales(mensaje)
+    log.warning("%s (%s)", mensaje, _sin_credenciales(excepcion))
     _escribir_cache(K_ERROR, mensaje, REINTENTO_SEGUNDOS)
     return _respaldo_o_error(mensaje)
 
