@@ -130,14 +130,17 @@ MAILERS = {
 }
 
 
-# Caché de los precios de Bencina en Línea (ver viajes/bencina.py). En archivo, para que los últimos datos descargados
-# sobrevivan a un reinicio del servidor y sirvan de respaldo si la API no responde. Las pruebas usan memoria para no tocarlos.
+# Datos de Bencina en Línea (ver viajes/bencina.py). La carpeta guarda dos cosas: la caché «fresca» de una hora (Django, en archivo)
+# y el respaldo permanente respaldo.json, que no caduca y sobrevive a reinicios. Las pruebas usan memoria y una carpeta temporal.
 if "test" in sys.argv:
+    import tempfile
+    BENCINA_RESPALDO_DIR = tempfile.mkdtemp(prefix="bencina-pruebas-")
     CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
 else:
+    BENCINA_RESPALDO_DIR = os.environ.get("BENCINA_CACHE_DIR", str(BASE_DIR / ".cache_bencina"))
     CACHES = {
         "default": {
             "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
-            "LOCATION": os.environ.get("BENCINA_CACHE_DIR", str(BASE_DIR / ".cache_bencina")),
+            "LOCATION": BENCINA_RESPALDO_DIR,
         }
     }

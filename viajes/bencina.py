@@ -12,13 +12,17 @@ precios 93/95/97 que pasaron la validación (los demás se consideran "sin dato"
 import json
 import logging
 import os
+import shutil
+import tempfile
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from functools import lru_cache
 
 import requests
 import urllib3
+from django.conf import settings
 from django.core.cache import cache
 from django.utils import timezone
 
@@ -27,13 +31,18 @@ log = logging.getLogger(__name__)
 API_BASE = os.environ.get("BENCINA_API_BASE", "https://api.bencinaenlinea.cl/api")
 TIMEOUT = float(os.environ.get("BENCINA_TIMEOUT", "15"))
 CACHE_SEGUNDOS = int(os.environ.get("BENCINA_CACHE_SEGUNDOS", "3600"))  # datos "frescos"
-RESPALDO_SEGUNDOS = 7 * 24 * 3600  # si la API falla, se muestran los últimos datos buenos
 REINTENTO_SEGUNDOS = 60  # tras un fallo no se vuelve a consultar durante este tiempo
 ARCHIVO_LOCAL = os.environ.get("BENCINA_JSON_LOCAL", "")  # JSON con el formato de la muestra
 # Verificación del certificado TLS de la API. Solo se desactiva a propósito (BENCINA_VERIFICAR_TLS=0), por ejemplo si el
 # certificado del servidor está vencido; mientras tanto la página avisa que la conexión no está verificada.
 VERIFICAR_TLS = os.environ.get("BENCINA_VERIFICAR_TLS", "1") != "0"
 USER_AGENT = "proyectobencina/1.0 (proyecto universitario USM; uso ciudadano)"
+
+# Respaldo permanente: respaldo.json (y respaldo.previo.json con la copia anterior) dentro de la carpeta de la caché. No caduca.
+CARPETA_RESPALDO = Path(getattr(settings, "BENCINA_RESPALDO_DIR", ".cache_bencina"))
+VERSION_RESPALDO = 1
+MIN_ESTACIONES = 10  # una descarga con menos estaciones que esto no se considera válida
+FRACCION_MIN = 0.5   # ni la que pierde más de la mitad de las estaciones (o de las estaciones con precio) de la copia anterior
 
 COMBUSTIBLES = ("93", "95", "97")
 RANGO_PRECIO = (500, 2500)  # $/L; fuera de este rango se descarta (ceros, 99999, etc.)
@@ -45,7 +54,7 @@ if not VERIFICAR_TLS:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     log.warning("BENCINA_VERIFICAR_TLS=0: las consultas a la API no verifican el certificado TLS.")
 
-K_FRESCO, K_RESPALDO, K_ERROR = "bencina:fresco", "bencina:respaldo", "bencina:error"
+K_FRESCO, K_ERROR = "bencina:fresco", "bencina:error"
 
 
 @dataclass
@@ -55,6 +64,7 @@ class Datos:
     consultado: object = None  # datetime (UTC) de la consulta a la fuente
     aviso: str = ""
     descartados: dict = field(default_factory=dict)
+    completa: bool = True  # False: una parte (p. ej. las marcas) no se pudo actualizar y se reutilizó de la copia anterior
 
     @property
     def ok(self):
@@ -112,6 +122,10 @@ def grupo_combustible(nombre_corto):
     return c if c in COMBUSTIBLES else None
 
 
+CAMPOS_ESTACION = {"id", "marca", "region", "comuna", "direccion", "latitud", "longitud", "combustibles"}
+CAMPOS_COMBUSTIBLE = {"nombre_corto", "nombre_largo", "tipo_atencion_nombre", "unidad_cobro", "precio", "precio_fecha"}
+
+
 def normalizar_estacion(raw, marcas, descartados=None, ahora_=None):
     """Convierte una estación cruda de la API al formato común; None si no sirve."""
     descartados = descartados if descartados is not None else {}
@@ -120,9 +134,16 @@ def normalizar_estacion(raw, marcas, descartados=None, ahora_=None):
         return None
 
     precios = {}
+    todos = []  # todos los combustibles tal como llegan (DI, KE, GNC, A93...), sin filtros: el recomendador usa solo `precios`
     for c in raw.get("combustibles") or []:
         if not isinstance(c, dict):
             continue
+        todos.append({
+            "codigo": str(c.get("nombre_corto") or "").strip(), "nombre": c.get("nombre_largo"),
+            "atencion": c.get("tipo_atencion_nombre") or "", "unidad": c.get("unidad_cobro"),
+            "precio": a_float(c.get("precio")), "fecha": c.get("precio_fecha"),
+            "extra": {k: v for k, v in c.items() if k not in CAMPOS_COMBUSTIBLE},
+        })
         grupo = grupo_combustible(c.get("nombre_corto"))
         if not grupo:
             continue
@@ -155,6 +176,8 @@ def normalizar_estacion(raw, marcas, descartados=None, ahora_=None):
         "lat": lat,
         "lon": lon,
         "precios": precios,
+        "combustibles": todos,
+        "extra": {k: v for k, v in raw.items() if k not in CAMPOS_ESTACION},  # cualquier otro campo que entregue la API
     }
 
 
@@ -211,13 +234,14 @@ def _get_json(ruta):
 
 
 def _descargar():
+    """(respuesta de estaciones, respuesta de marcas o None). Sin marcas igual sirve: se reutilizan las anteriores."""
     estaciones_json = _get_json("busqueda_estacion_filtro")
     try:
         marcas_json = _get_json("marca_ciudadano")
-    except (requests.RequestException, ValueError):  # sin marcas igual sirve: "Sin marca"
+    except (requests.RequestException, ValueError):
         log.warning("No se pudo obtener la lista de marcas.")
         marcas_json = None
-    return normalizar_respuesta(estaciones_json, marcas_json)
+    return estaciones_json, marcas_json
 
 
 def _desde_archivo(ruta):
@@ -225,6 +249,118 @@ def _desde_archivo(ruta):
         contenido = json.load(f)
     estaciones, descartados = normalizar_respuesta(contenido.get("estaciones"), contenido.get("marcas"))
     return Datos(estaciones, "archivo", timezone.now(), "Datos de un archivo local, no de la consulta en vivo.", descartados)
+
+
+# ---------- caché fresca (Django, 1 hora) ----------
+def _leer_cache(clave):
+    try:
+        return cache.get(clave)
+    except Exception as e:  # un archivo de caché dañado nunca debe tumbar la página
+        log.warning("No se pudo leer la caché (%s): se ignora. (%s)", clave, e)
+        return None
+
+
+def _escribir_cache(clave, valor, segundos):
+    try:
+        cache.set(clave, valor, segundos)
+    except Exception as e:
+        log.warning("No se pudo escribir la caché (%s): %s", clave, e)
+
+
+# ---------- respaldo permanente (JSON) ----------
+def _ruta_respaldo(previo=False):
+    return CARPETA_RESPALDO / ("respaldo.previo.json" if previo else "respaldo.json")
+
+
+_memo = {}  # ruta -> (firma del archivo, documento): evita releer varios MB en cada carga de la página
+
+
+def _cargar_respaldo(ruta):
+    """Documento del respaldo o None si no existe o no es válido. Nunca borra ni modifica el archivo."""
+    try:
+        est = ruta.stat()
+        firma = (est.st_mtime_ns, est.st_size)
+        if _memo.get(ruta, (None,))[0] == firma:
+            return _memo[ruta][1]
+        with open(ruta, encoding="utf-8") as f:
+            doc = json.load(f)
+        ok = (
+            isinstance(doc, dict) and doc.get("version") == VERSION_RESPALDO
+            and isinstance(doc.get("estaciones"), list) and doc["estaciones"]
+            and all(isinstance(e, dict) and "id" in e and isinstance(e.get("precios"), dict) for e in doc["estaciones"])
+        )
+        if ok:
+            datetime.fromisoformat(doc["descargado"])
+        else:
+            raise ValueError("estructura inesperada")
+    except FileNotFoundError:
+        return None
+    except Exception as e:  # JSON corrupto, permisos, estructura distinta...
+        log.warning("El respaldo %s no se pudo usar y se deja como está: %s", ruta.name, e)
+        return None
+    _memo[ruta] = (firma, doc)
+    return doc
+
+
+def _leer_respaldo():
+    """La última copia válida: respaldo.json y, si no sirve, la anterior (respaldo.previo.json)."""
+    return _cargar_respaldo(_ruta_respaldo()) or _cargar_respaldo(_ruta_respaldo(previo=True))
+
+
+def _escribir_atomico(destino, contenido):
+    """Escribe en un archivo temporal de la misma carpeta y lo cambia de nombre: el destino nunca queda a medias."""
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=destino.parent, prefix=".tmp-", suffix=".json", delete=False, encoding="utf-8") as f:
+            tmp = Path(f.name)
+            f.write(contenido)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, destino)
+    except BaseException:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        raise
+
+
+def _guardar_respaldo(doc):
+    """Guarda `doc` como respaldo. La copia vigente (si es válida) pasa a respaldo.previo.json. True si quedó guardado."""
+    tmp_prev = None
+    try:
+        CARPETA_RESPALDO.mkdir(parents=True, exist_ok=True)
+        actual = _ruta_respaldo()
+        if _cargar_respaldo(actual):  # solo se rota una copia válida: una dañada no pisa a la anterior
+            tmp_prev = actual.with_name(".tmp-previo.json")
+            shutil.copy2(actual, tmp_prev)
+            os.replace(tmp_prev, _ruta_respaldo(previo=True))
+        _escribir_atomico(actual, json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
+        return True
+    except Exception as e:
+        if tmp_prev is not None:
+            tmp_prev.unlink(missing_ok=True)
+        log.error("No se pudo guardar el respaldo en %s: %s", CARPETA_RESPALDO, e)
+        return False
+
+
+def _validar_descarga(estaciones, previo):
+    """Texto con el motivo si la descarga no sirve para reemplazar la copia anterior; "" si está bien."""
+    con_precio = sum(1 for e in estaciones if e["precios"])
+    if len(estaciones) < MIN_ESTACIONES:
+        return f"solo {len(estaciones)} estaciones"
+    if con_precio < len(estaciones) * FRACCION_MIN:
+        return f"solo {con_precio} de {len(estaciones)} estaciones traen precios"
+    if previo:
+        antes = previo["estaciones"]
+        antes_con_precio = sum(1 for e in antes if e["precios"])
+        if len(estaciones) < len(antes) * FRACCION_MIN:
+            return f"trae {len(estaciones)} estaciones y la copia anterior tenía {len(antes)}"
+        if con_precio < antes_con_precio * FRACCION_MIN:
+            return f"trae {con_precio} estaciones con precio y la copia anterior tenía {antes_con_precio}"
+    return ""
+
+
+def _marcas_validas(marcas_json):
+    return isinstance(marcas_json, dict) and isinstance(marcas_json.get("data"), list) and bool(marcas_json["data"])
 
 
 def obtener_datos(forzar=False):
@@ -236,14 +372,20 @@ def obtener_datos(forzar=False):
             return Datos(aviso=f"No se pudo leer el archivo local ({e}).")
 
     if not forzar:
-        fresco = cache.get(K_FRESCO)
-        if fresco:
+        fresco = _leer_cache(K_FRESCO)
+        if isinstance(fresco, Datos) and fresco.ok:
             return fresco
-        if cache.get(K_ERROR):  # falló hace poco: no insistir en cada carga de la página
-            return _respaldo_o_error(cache.get(K_ERROR))
+        error = _leer_cache(K_ERROR)
+        if error:  # falló hace poco: no insistir en cada carga de la página
+            return _respaldo_o_error(error)
 
+    previo = _leer_respaldo()
     try:
-        estaciones, descartados = _descargar()
+        estaciones_json, marcas_json = _descargar()
+        marcas_ok = _marcas_validas(marcas_json)
+        if not marcas_ok:  # marcas de la descarga anterior, si las hay
+            marcas_json = ((previo or {}).get("crudo") or {}).get("marcas")
+        estaciones, descartados = normalizar_respuesta(estaciones_json, marcas_json)
     except requests.Timeout as e:
         return _fallo(f"Bencina en Línea no respondió en {TIMEOUT:g} s.", e)
     except requests.exceptions.SSLError as e:
@@ -258,26 +400,50 @@ def obtener_datos(forzar=False):
     except (requests.RequestException, ValueError) as e:  # JSON inválido o respuesta vacía
         return _fallo(f"Bencina en Línea devolvió una respuesta que no se pudo interpretar ({str(e)[:200]}).", e)
 
-    aviso = "" if VERIFICAR_TLS else "Conexión con la API sin verificar el certificado TLS (BENCINA_VERIFICAR_TLS=0)."
-    datos = Datos(estaciones, "api", timezone.now(), aviso, descartados)
-    cache.set(K_FRESCO, datos, CACHE_SEGUNDOS)
-    cache.set(K_RESPALDO, datos, RESPALDO_SEGUNDOS)
-    cache.delete(K_ERROR)
+    motivo = _validar_descarga(estaciones, previo)
+    if motivo:  # defectuosa o incompleta: no reemplaza la copia buena
+        return _fallo(f"La descarga se rechazó porque parece incompleta ({motivo}); se conserva la copia anterior.", ValueError(motivo))
+
+    ahora_utc = timezone.now()
+    avisos = [] if VERIFICAR_TLS else ["Conexión con la API sin verificar el certificado TLS (BENCINA_VERIFICAR_TLS=0)."]
+    if not marcas_ok:
+        avisos.append("No se pudieron actualizar las marcas" + ("; se usan las de la descarga anterior." if marcas_json else "."))
+    doc = {
+        "version": VERSION_RESPALDO,
+        "descargado": ahora_utc.isoformat(),
+        "completa": marcas_ok,
+        "endpoints": {
+            "busqueda_estacion_filtro": {"ok": True, "n": len(estaciones)},
+            "marca_ciudadano": {"ok": marcas_ok, "n": len((marcas_json or {}).get("data") or [])},
+        },
+        "descartados": descartados,
+        "estaciones": estaciones,  # normalizadas: lo que usa la aplicación
+        "crudo": {"estaciones": estaciones_json, "marcas": marcas_json},  # respuestas originales de la API
+    }
+    if not _guardar_respaldo(doc):
+        avisos.append("No se pudo guardar la copia local de los datos.")
+    datos = Datos(estaciones, "api", ahora_utc, " ".join(avisos), descartados, completa=marcas_ok)
+    _escribir_cache(K_FRESCO, datos, CACHE_SEGUNDOS)
+    try:
+        cache.delete(K_ERROR)
+    except Exception:
+        pass
     return datos
 
 
 def _fallo(mensaje, excepcion):
     log.warning("%s (%s)", mensaje, excepcion)
-    cache.set(K_ERROR, mensaje, REINTENTO_SEGUNDOS)
+    _escribir_cache(K_ERROR, mensaje, REINTENTO_SEGUNDOS)
     return _respaldo_o_error(mensaje)
 
 
 def _respaldo_o_error(mensaje):
-    respaldo = cache.get(K_RESPALDO)
+    respaldo = _leer_respaldo()
     if respaldo:
         return Datos(
-            respaldo.estaciones, "respaldo", respaldo.consultado,
-            f"{mensaje} Se muestran los últimos precios obtenidos.", respaldo.descartados,
+            respaldo["estaciones"], "respaldo", datetime.fromisoformat(respaldo["descargado"]),
+            f"{mensaje} Se muestran los últimos precios obtenidos.", respaldo.get("descartados") or {},
+            completa=bool(respaldo.get("completa", True)),
         )
     return Datos(aviso=f"{mensaje} No hay precios guardados para mostrar.")
 

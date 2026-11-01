@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from unittest import mock
 
@@ -282,3 +283,189 @@ class CertificadoTlsTests(ConCache):
         self.assertFalse(get.call_args.kwargs["verify"])
         self.assertIn("sin verificar", d.aviso)
         self.assertTrue(d.ok)
+
+
+class RespaldoJsonTests(ConCache):
+    """Respaldo permanente en respaldo.json: se guarda, no caduca, no se pisa con descargas malas y sobrevive a fallos."""
+
+    def bajar(self, muestra=None, **kw):
+        with mock.patch("viajes.bencina.requests.get", side_effect=api_falsa(muestra)):
+            return bencina.obtener_datos(forzar=True, **kw)
+
+    def caida(self, exc=None):
+        with mock.patch("viajes.bencina.requests.get", side_effect=exc or requests.ConnectionError("sin red")):
+            return bencina.obtener_datos(forzar=True)
+
+    def doc(self, previo=False):
+        return json.loads(bencina._ruta_respaldo(previo).read_text(encoding="utf-8"))
+
+    def reiniciar(self):  # lo que pasa al cerrar y abrir Django: se pierde la memoria, queda el disco
+        bencina.cache.clear()
+        bencina._memo.clear()
+
+    # --- A: primera descarga ---
+    def test_primera_descarga_guarda_todo_en_disco(self):
+        d = self.bajar()
+        self.assertEqual(d.fuente, "api")
+        doc = self.doc()
+        self.assertEqual(len(doc["estaciones"]), len(d.estaciones))
+        self.assertTrue(doc["completa"])
+        self.assertTrue(doc["endpoints"]["marca_ciudadano"]["ok"])
+        self.assertEqual(len(doc["crudo"]["estaciones"]["data"]), 35)  # respuesta original
+        self.assertEqual(len(doc["crudo"]["marcas"]["data"]), len(cargar_muestra()["marcas"]["data"]))
+        codigos = {c["codigo"] for e in doc["estaciones"] for c in e["combustibles"]}
+        self.assertTrue({"93", "95", "97", "DI", "KE", "GNC", "A93", "A95", "A97", "ADI"} <= codigos)
+        c = next(c for e in doc["estaciones"] for c in e["combustibles"] if c["codigo"] == "DI")
+        self.assertTrue(c["nombre"] and c["unidad"] and c["precio"] and c["fecha"])  # nombre largo, unidad de cobro, precio y fecha
+
+    def test_el_recomendador_sigue_viendo_solo_93_95_97(self):
+        for e in self.bajar().estaciones:
+            self.assertLessEqual(set(e["precios"]), {"93", "95", "97"})
+
+    # --- B: reinicio, y sin caducidad ---
+    def test_sobrevive_a_un_reinicio_y_no_caduca(self):
+        self.bajar()
+        doc = self.doc()
+        doc["descargado"] = "2026-06-01T12:00:00+00:00"  # una copia de hace meses
+        bencina._ruta_respaldo().write_text(json.dumps(doc), encoding="utf-8")
+        self.reiniciar()
+        d = self.caida()
+        self.assertEqual(d.fuente, "respaldo")
+        self.assertEqual(len(d.estaciones), 35)
+        self.assertEqual(d.consultado.isoformat(), "2026-06-01T12:00:00+00:00")  # se informa su fecha real
+
+    # --- C: API caída (todos los tipos de fallo) ---
+    def test_api_caida_usa_la_copia_guardada(self):
+        self.bajar()
+        for exc in (requests.ConnectionError("x"), requests.Timeout("x"), requests.exceptions.SSLError("certificate has expired")):
+            d = self.caida(exc)
+            self.assertEqual(d.fuente, "respaldo", exc)
+            self.assertTrue(d.ok)
+        for r in (RespuestaFalsa(None, status=500), RespuestaFalsa(None, json_invalido=True)):
+            with mock.patch("viajes.bencina.requests.get", return_value=r):
+                self.assertEqual(bencina.obtener_datos(forzar=True).fuente, "respaldo")
+
+    # --- D: descarga defectuosa ---
+    def test_descarga_incompleta_no_pisa_la_copia_buena(self):
+        self.bajar()
+        antes = bencina._ruta_respaldo().read_bytes()
+        malas = []
+        m = cargar_muestra(); m["estaciones"]["data"] = m["estaciones"]["data"][:1]; malas.append(m)  # 1 sola estación
+        m = cargar_muestra(); m["estaciones"]["data"] = m["estaciones"]["data"][:12]; malas.append(m)  # menos de la mitad
+        m = cargar_muestra()
+        for e in m["estaciones"]["data"]:
+            e["combustibles"] = []
+        malas.append(m)  # estaciones sin precios
+        m = cargar_muestra(); m["estaciones"] = {"data": []}; malas.append(m)  # vacía
+        m = cargar_muestra(); m["estaciones"] = {"error": "x"}; malas.append(m)  # otro formato
+        for mala in malas:
+            d = self.bajar(mala)
+            self.assertEqual(d.fuente, "respaldo")
+            self.assertEqual(len(d.estaciones), 35)
+            self.assertEqual(bencina._ruta_respaldo().read_bytes(), antes)  # el archivo ni se tocó
+        self.assertIn("incompleta", self.bajar(malas[0]).aviso)
+
+    # --- marcas ---
+    def test_si_fallan_las_marcas_se_conservan_las_anteriores(self):
+        self.bajar()
+        marcas_antes = {e["marca"] for e in self.doc()["estaciones"]}
+        self.assertNotEqual(marcas_antes, {"Sin marca"})
+
+        def sin_marcas(url, **kw):
+            if url.endswith("marca_ciudadano"):
+                raise requests.ConnectionError("x")
+            return api_falsa()(url, **kw)
+
+        with mock.patch("viajes.bencina.requests.get", side_effect=sin_marcas):
+            d = bencina.obtener_datos(forzar=True)
+        self.assertEqual(d.fuente, "api")
+        self.assertFalse(d.completa)
+        self.assertEqual({e["marca"] for e in d.estaciones}, marcas_antes)
+        self.assertIn("marcas", d.aviso)
+        doc = self.doc()
+        self.assertFalse(doc["completa"])
+        self.assertEqual(len(doc["crudo"]["marcas"]["data"]), len(cargar_muestra()["marcas"]["data"]))  # marcas previas conservadas
+
+    def test_si_las_marcas_llegan_vacias_se_tratan_como_fallo(self):
+        self.bajar()
+        m = cargar_muestra(); m["marcas"] = {"data": []}
+        d = self.bajar(m)
+        self.assertFalse(d.completa)
+        self.assertNotEqual({e["marca"] for e in d.estaciones}, {"Sin marca"})
+
+    # --- escritura atómica ---
+    def test_si_falla_la_escritura_no_se_pierde_la_copia_ni_se_deja_basura(self):
+        self.bajar()
+        antes = bencina._ruta_respaldo().read_bytes()
+        with mock.patch("viajes.bencina.os.replace", side_effect=OSError("disco lleno")):
+            d = self.bajar()
+        self.assertEqual(d.fuente, "api")  # igual se muestran los datos recién descargados
+        self.assertIn("No se pudo guardar", d.aviso)
+        self.assertEqual(bencina._ruta_respaldo().read_bytes(), antes)
+        self.assertEqual([p.name for p in self.carpeta.iterdir() if p.name.startswith(".tmp")], [])
+
+    def test_la_copia_vigente_pasa_a_previo(self):
+        self.bajar()
+        primera = self.doc()["descargado"]
+        self.bajar()
+        self.assertEqual(self.doc(previo=True)["descargado"], primera)
+
+    # --- archivos dañados ---
+    def test_json_corrupto_usa_la_copia_previa_y_no_borra_nada(self):
+        self.bajar(); self.bajar()
+        bencina._ruta_respaldo().write_text('{"version": 1, "estaciones": [', encoding="utf-8")  # cortado a la mitad
+        bencina._memo.clear()
+        with self.assertLogs("viajes.bencina", "WARNING"):
+            d = self.caida()
+        self.assertEqual(d.fuente, "respaldo")
+        self.assertEqual(len(d.estaciones), 35)
+        self.assertTrue(bencina._ruta_respaldo().exists())  # el dañado se deja para revisarlo
+        self.assertTrue(bencina._ruta_respaldo(previo=True).exists())
+
+    def test_un_respaldo_danado_no_pisa_a_la_copia_previa_valida(self):
+        self.bajar(); self.bajar()
+        previo = bencina._ruta_respaldo(previo=True).read_bytes()
+        bencina._ruta_respaldo().write_text("no es json", encoding="utf-8")
+        bencina._memo.clear()
+        self.bajar()  # descarga buena: reemplaza el dañado, sin rotarlo sobre el previo
+        self.assertEqual(bencina._ruta_respaldo(previo=True).read_bytes(), previo)
+        self.assertEqual(len(self.doc()["estaciones"]), 35)
+
+    def test_todo_danado_o_con_estructura_rara_no_lanza_errores(self):
+        for contenido in ("", "null", "[]", '{"version": 2}', '{"version": 1, "estaciones": [], "descargado": "x"}',
+                          '{"version": 1, "estaciones": [1], "descargado": "2026-01-01T00:00:00+00:00"}', "\x00\x01"):
+            self.carpeta.joinpath("respaldo.json").write_text(contenido, encoding="utf-8")
+            bencina._memo.clear()
+            d = self.caida()
+            self.assertFalse(d.ok, contenido)
+            self.assertIn("No hay precios guardados", d.aviso)
+
+    def test_cache_fresca_danada_no_provoca_errores(self):
+        self.bajar()
+        with mock.patch("viajes.bencina.cache.get", side_effect=EOFError("pickle corrupto")), \
+                mock.patch("viajes.bencina.requests.get", side_effect=api_falsa()):
+            d = bencina.obtener_datos()
+        self.assertTrue(d.ok)
+        with mock.patch("viajes.bencina.cache.get", side_effect=EOFError("x")), mock.patch("viajes.bencina.cache.set", side_effect=OSError("x")), \
+                mock.patch("viajes.bencina.requests.get", side_effect=requests.ConnectionError("x")):
+            self.assertEqual(bencina.obtener_datos().fuente, "respaldo")
+
+    # --- E: recuperación ---
+    def test_cuando_vuelve_la_api_se_actualiza_la_copia(self):
+        self.bajar()
+        self.assertEqual(self.caida().fuente, "respaldo")
+        antes = self.doc()["descargado"]
+        m = cargar_muestra(); m["estaciones"]["data"][0]["combustibles"][0]["precio"] = "1111"
+        d = self.bajar(m)
+        self.assertEqual(d.fuente, "api")
+        self.assertNotEqual(self.doc()["descargado"], antes)
+        self.assertIn(1111.0, [c["precio"] for c in self.doc()["estaciones"][0]["combustibles"]])
+        self.assertEqual(self.doc(previo=True)["descargado"], antes)
+
+    # --- F: sin copia ---
+    def test_sin_copia_y_sin_api_el_mensaje_es_claro(self):
+        d = self.caida()
+        self.assertFalse(d.ok)
+        self.assertIn("No hay precios guardados", d.aviso)
+        self.assertEqual(d.estaciones, [])
+        self.assertFalse(bencina._ruta_respaldo().exists())  # no se inventa ni se crea nada

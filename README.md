@@ -97,7 +97,10 @@ La estación que viene repetida en la respuesta de la API (mismo `id`) se cuenta
 ## Cómo se manejan los datos
 
 - `viajes/bencina.py` consulta y normaliza la API; `viajes/views.py` solo usa el resultado.
-- **Caché de 1 hora** en memoria. Si la API falla, se muestran los últimos datos buenos (hasta 7 días) con un aviso, y no se reintenta durante 60 s. Sin datos guardados, la página muestra el error y sigue funcionando (la calculadora de repostaje no depende de la API).
+- **Caché de 1 hora** (en archivo, dentro de `.cache_bencina/`). Si una consulta falla no se reintenta durante 60 s.
+- **Respaldo permanente** (`.cache_bencina/respaldo.json`, más `respaldo.previo.json` con la copia anterior). Cada descarga válida lo reescribe de forma atómica (archivo temporal y cambio de nombre, así nunca queda a medias) y **no caduca**: sobrevive a reinicios de Django y del equipo. Guarda la hora de la descarga, si fue completa o parcial y el estado de cada endpoint, las **respuestas originales** de la API (estaciones y marcas) y los **datos normalizados** que usa la aplicación. Además de 93, 95 y 97, conserva todos los combustibles que entrega la API (DI, KE, GNC, A93, A95, A97, ADI…) con su nombre largo, unidad de cobro, fecha y tipo de atención, y cualquier otro campo que venga en cada estación. El recomendador sigue usando solo 93, 95 y 97.
+- **Protección del respaldo.** Una descarga no reemplaza la copia buena si trae menos de 10 estaciones, si menos de la mitad tiene precios o si pierde más de la mitad de las estaciones (o de las estaciones con precio) de la copia anterior; en ese caso se conserva la copia y el aviso dice por qué. Si falla solo el endpoint de marcas, se reutilizan las de la descarga anterior y la descarga queda marcada como parcial. Un JSON corrupto o ilegible se ignora (se prueba con la copia anterior) sin borrarlo y sin provocar un error 500.
+- **Cuando la API no responde** se muestran los datos guardados con la etiqueta «Datos guardados, no son precios actuales» y la fecha de su última descarga, por antiguos que sean (no se vuelven a filtrar por antigüedad). Sin ninguna copia, la página lo dice y no inventa datos.
 - Se descartan precios fuera de $500–$2.500/L y precios con más de 30 días; las coordenadas con coma decimal se interpretan y las que caen fuera de Chile se ignoran (esa estación queda en la lista, sin marcador). «A93» (asistido) y «93» (autoservicio) se juntan en un solo combustible, con el precio más bajo.
 - Cada estación se identifica por su `id` de la fuente; precios, dirección y coordenadas siempre salen del mismo registro (no se cruzan por nombre).
 
@@ -108,7 +111,8 @@ Variables de entorno opcionales:
 | `BENCINA_API_BASE` | `https://api.bencinaenlinea.cl/api` | URL base de la API |
 | `BENCINA_TIMEOUT` | `15` | Segundos de espera por consulta |
 | `BENCINA_VERIFICAR_TLS` | `1` | Con `0` no se verifica el certificado TLS de la API (solo si su certificado está vencido o mal configurado); la página avisa que la conexión no está verificada |
-| `BENCINA_CACHE_SEGUNDOS` | `3600` | Duración de la caché |
+| `BENCINA_CACHE_SEGUNDOS` | `3600` | Duración de la caché fresca (el respaldo permanente no caduca) |
+| `BENCINA_CACHE_DIR` | `.cache_bencina` | Carpeta de la caché y del respaldo permanente |
 | `BENCINA_MAX_DIAS` | `30` | Antigüedad máxima de un precio |
 | `BENCINA_JSON_LOCAL` | vacío | Leer un archivo en vez de la API |
 
@@ -132,7 +136,7 @@ Cómo se verificó el trabajo de la IA: 67 pruebas automáticas (`python manage.
 python manage.py test
 ```
 
-67 pruebas (normalización, selector de marca y modelo, catálogo referencial, caché, errores de red, recomendador, calculadora, filtros y endpoint del mapa). Usan una muestra real guardada en `viajes/tests/fixtures/`, no consultan internet.
+103 pruebas (normalización, selector de marca y modelo, catálogo referencial, caché, errores de red, recomendador, calculadora, filtros y endpoint del mapa). Usan una muestra real guardada en `viajes/tests/fixtures/`, no consultan internet.
 
 ## Catálogo ampliado (datos referenciales)
 
