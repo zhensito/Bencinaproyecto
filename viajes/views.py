@@ -345,6 +345,7 @@ def estaciones_json(request):
         "regiones": sorted({e["region"] for e in datos.estaciones if e["region"]}, key=orden),
         "comunas": [{"nombre": c, "region": r} for c, r in pares],
         "fuente": datos.fuente,
+        "completa": datos.completa,
         "consultado": datos.consultado.isoformat() if datos.consultado else None,
         "aviso": datos.aviso,
         "descartados": datos.descartados,

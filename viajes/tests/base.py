@@ -1,4 +1,5 @@
 import json
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
@@ -6,6 +7,8 @@ from unittest import mock
 import requests
 from django.core.cache import cache
 from django.test import SimpleTestCase
+
+from viajes import bencina
 
 MUESTRA = Path(__file__).parent / "fixtures" / "muestra_api.json"
 AHORA = datetime(2026, 10, 27, 12, 0)  # la muestra es del 22 al 26 de octubre de 2026
@@ -52,6 +55,13 @@ class ConCache(SimpleTestCase):
         parche = mock.patch("viajes.bencina.ARCHIVO_LOCAL", "")
         parche.start()
         self.addCleanup(parche.stop)
+        carpeta = tempfile.TemporaryDirectory(prefix="bencina-prueba-")  # cada prueba con su propio respaldo en disco
+        self.addCleanup(carpeta.cleanup)
+        self.carpeta = Path(carpeta.name)
+        parche_carpeta = mock.patch("viajes.bencina.CARPETA_RESPALDO", self.carpeta)
+        parche_carpeta.start()
+        self.addCleanup(parche_carpeta.stop)
+        bencina._memo.clear()
         reloj = mock.patch("viajes.bencina.ahora", return_value=AHORA)
         reloj.start()
         self.addCleanup(reloj.stop)
