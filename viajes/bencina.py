@@ -211,8 +211,10 @@ def normalizar_respuesta(estaciones_json, marcas_json=None, ahora_=None):
 
 # ---------- obtención ----------
 def _sin_credenciales(texto):
-    """Quita usuario y contraseña de las URL (p. ej. de un proxy) antes de mostrar o registrar un mensaje."""
-    return re.sub(r"(?<=://)[^/\s@]+@", "***@", str(texto))
+    """Oculta credenciales antes de mostrar o registrar un texto: `usuario:clave@` dentro de una URL (aunque la clave lleve «@»)
+    y parámetros como token=, key=, password=, clave=, secret=, apikey=."""
+    t = re.sub(r"(?<=://)[^/\s]*@", "***@", str(texto))
+    return re.sub(r"(?i)\b(token|access_token|key|api_key|apikey|password|pass|clave|secret)=[^&\s'\"]+", r"\1=***", t)
 
 
 def _leer(resp, limite, truncar=False):
@@ -239,6 +241,7 @@ def _get_json(ruta):
     y el comienzo de la respuesta, para poder saber por qué (un bloqueo, una página de error y un cambio de formato se ven distinto).
     El cuerpo se limita a MAX_BYTES: si lo supera se rechaza sin interpretarlo como JSON."""
     url = f"{API_BASE}/{ruta}"
+    url_log = _sin_credenciales(url)  # lo que se registra nunca lleva credenciales
     resp = requests.get(
         url, timeout=TIMEOUT, verify=VERIFICAR_TLS, stream=True, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
     )
@@ -247,7 +250,7 @@ def _get_json(ruta):
         try:
             resp.raise_for_status()
         except requests.HTTPError:
-            log.warning("HTTP %s en %s (content-type %s): %r", resp.status_code, url, tipo, _muestra(_leer(resp, 200, truncar=True)))
+            log.warning("HTTP %s en %s (content-type %s): %r", resp.status_code, url_log, tipo, _sin_credenciales(_muestra(_leer(resp, 200, truncar=True))))
             raise
         declarado = str((getattr(resp, "headers", None) or {}).get("Content-Length", ""))
         if declarado.isdigit() and int(declarado) > MAX_BYTES:  # aviso temprano; el control real es el conteo de bytes
@@ -255,13 +258,13 @@ def _get_json(ruta):
         try:
             cuerpo = _leer(resp, MAX_BYTES)
         except ValueError as e:
-            log.warning("%s: %s (%s)", url, e, tipo)
+            log.warning("%s: %s (%s)", url_log, _sin_credenciales(e), tipo)
             raise ValueError(f"{ruta}: {e}") from e
         try:
             return json.loads(cuerpo)
         except ValueError as e:
-            log.warning("Respuesta no JSON en %s (HTTP %s, content-type %s): %r", url, resp.status_code, tipo, _muestra(cuerpo))
-            raise ValueError(f"{ruta} no devolvió JSON (HTTP {resp.status_code}, {tipo}): {_muestra(cuerpo, 60)!r}") from e
+            log.warning("Respuesta no JSON en %s (HTTP %s, content-type %s): %r", url_log, resp.status_code, tipo, _sin_credenciales(_muestra(cuerpo)))
+            raise ValueError(f"{ruta} no devolvió JSON (HTTP {resp.status_code}, {tipo}): {_sin_credenciales(_muestra(cuerpo, 60))!r}") from e
     finally:
         resp.close()
 
@@ -271,8 +274,8 @@ def _descargar():
     estaciones_json = _get_json("busqueda_estacion_filtro")
     try:
         marcas_json = _get_json("marca_ciudadano")
-    except (requests.RequestException, ValueError):
-        log.warning("No se pudo obtener la lista de marcas.")
+    except (requests.RequestException, ValueError) as e:
+        log.warning("No se pudo obtener la lista de marcas (%s).", _sin_credenciales(e))
         marcas_json = None
     return estaciones_json, marcas_json
 
@@ -289,7 +292,7 @@ def _leer_cache(clave):
     try:
         return cache.get(clave)
     except Exception as e:  # un archivo de caché dañado nunca debe tumbar la página
-        log.warning("No se pudo leer la caché (%s): se ignora. (%s)", clave, e)
+        log.warning("No se pudo leer la caché (%s): se ignora. (%s)", clave, _sin_credenciales(e))
         return None
 
 
@@ -297,7 +300,7 @@ def _escribir_cache(clave, valor, segundos):
     try:
         cache.set(clave, valor, segundos)
     except Exception as e:
-        log.warning("No se pudo escribir la caché (%s): %s", clave, e)
+        log.warning("No se pudo escribir la caché (%s): %s", clave, _sin_credenciales(e))
 
 
 # ---------- respaldo permanente (JSON) ----------
@@ -329,7 +332,7 @@ def _cargar_respaldo(ruta):
     except FileNotFoundError:
         return None
     except Exception as e:  # JSON corrupto, permisos, estructura distinta...
-        log.warning("El respaldo %s no se pudo usar y se deja como está: %s", ruta.name, e)
+        log.warning("El respaldo %s no se pudo usar y se deja como está: %s", ruta.name, _sin_credenciales(e))
         return None
     _memo[ruta] = (firma, doc)
     return doc
@@ -356,22 +359,31 @@ def _escribir_atomico(destino, contenido):
         raise
 
 
+PATRONES_TEMPORALES = (".tmp-resp-*.json", ".tmp-previo-*.json")  # los únicos nombres que crea este módulo
+
+
 def _limpiar_temporales(carpeta, edad=3600):
-    """Borra solo los temporales (.tmp-*) abandonados hace más de `edad` segundos, p. ej. por un corte de luz a mitad de la escritura."""
+    """Borra solo los temporales propios (PATRONES_TEMPORALES) con más de `edad` segundos sin modificarse, que quedaron
+    abandonados por una caída a mitad de la escritura. Una escritura en curso termina en segundos, así que no se toca;
+    cualquier otro archivo de la carpeta, incluidos los respaldos, queda como está."""
     limite = datetime.now().timestamp() - edad
-    for t in carpeta.glob(".tmp-*"):
-        try:
-            if t.stat().st_mtime < limite:
-                t.unlink()
-        except OSError:
-            pass
+    for patron in PATRONES_TEMPORALES:
+        for t in carpeta.glob(patron):
+            try:
+                if t.is_file() and not t.is_symlink() and t.stat().st_mtime < limite:
+                    t.unlink()
+            except OSError:  # p. ej. en uso en Windows: se deja para la próxima vez
+                pass
 
 
 def _guardar_respaldo(doc):
     """Guarda `doc` como respaldo. La copia vigente (si es válida) pasa a respaldo.previo.json. True si quedó guardado.
 
-    Cada escritura usa archivos temporales de nombre único y se publica con os.replace (atómico), así que dos procesos o
-    solicitudes que guarden a la vez no pueden dejar un archivo a medias: gana la última y la otra queda como copia previa.
+    Garantías: cada archivo (respaldo.json y respaldo.previo.json) se publica entero con os.replace y nunca queda a medias,
+    y los temporales tienen nombre único. NO es una única operación atómica: la rotación (copiar a previo) y la publicación
+    del nuevo archivo son dos pasos. Si dos procesos guardan a la vez, ambos archivos siguen siendo válidos, pero puede ganar
+    la descarga que terminó de publicar al final aunque no sea la más reciente, y la copia previa puede ser cualquiera de las
+    dos versiones anteriores. Para este uso (una descarga por hora) no se justifica un bloqueo entre procesos.
     """
     tmp_prev = None
     try:
@@ -449,7 +461,7 @@ def obtener_datos(forzar=False):
         return _fallo(f"No se pudo conectar con Bencina en Línea ({type(e).__name__}: {str(e)[:150]}).", e)
     except requests.HTTPError as e:
         r = e.response
-        return _fallo(f"Bencina en Línea respondió con error HTTP {r.status_code} en {getattr(r, 'url', API_BASE)}.", e)
+        return _fallo(f"Bencina en Línea respondió con error HTTP {r.status_code} en {_sin_credenciales(getattr(r, 'url', API_BASE))}.", e)
     except (requests.RequestException, ValueError) as e:  # JSON inválido o respuesta vacía
         return _fallo(f"Bencina en Línea devolvió una respuesta que no se pudo interpretar ({str(e)[:200]}).", e)
 
