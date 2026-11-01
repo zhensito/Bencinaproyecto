@@ -564,16 +564,23 @@ class EndurecimientoTests(ConCache):
         self.assertEqual({n: self.carpeta.joinpath(n).read_bytes() for n in antes}, antes)
         self.assertEqual([p.name for p in self.carpeta.iterdir() if p.name.startswith(".tmp")], [])
 
-    def test_temporales_abandonados_antiguos_se_limpian_y_los_recientes_no(self):
+    def test_temporales_propios_abandonados_se_limpian_y_los_recientes_o_ajenos_no(self):
         import os
         import time
 
-        viejo, nuevo = self.carpeta / ".tmp-viejo.json", self.carpeta / ".tmp-nuevo.json"
-        viejo.write_text("x"); nuevo.write_text("x")
-        os.utime(viejo, (time.time() - 7200, time.time() - 7200))
+        viejos = [self.carpeta / ".tmp-resp-abc.json", self.carpeta / ".tmp-previo-xyz.json"]
+        recientes = [self.carpeta / ".tmp-resp-activo.json", self.carpeta / ".tmp-previo-activo.json"]
+        ajenos = [self.carpeta / ".tmp-ajeno.json", self.carpeta / ".tmp-viejo.json", self.carpeta / "notas.tmp", self.carpeta / "datos.json"]
+        for t in viejos + recientes + ajenos:
+            t.write_text("x")
+        hace_2h = time.time() - 7200
+        for t in viejos + ajenos:
+            os.utime(t, (hace_2h, hace_2h))
         self.bajar()
-        self.assertFalse(viejo.exists())
-        self.assertTrue(nuevo.exists())
+        self.assertFalse(any(t.exists() for t in viejos))  # propios y abandonados
+        self.assertTrue(all(t.exists() for t in recientes))  # podrían ser de una escritura en curso
+        self.assertTrue(all(t.exists() for t in ajenos))  # no son de este módulo, aunque sean antiguos
+        self.assertTrue(self.carpeta.joinpath("respaldo.json").exists())
 
     # --- 4. ambos respaldos dañados: la página responde, sin error 500 ---
     def test_con_ambos_respaldos_danados_la_pagina_no_da_500(self):
@@ -673,3 +680,68 @@ class ConfiguracionDjangoTests(ConCache):
         c = Client()
         for ruta in ("/.cache_bencina/respaldo.json", "/respaldo.json", "/static/respaldo.json", "/static/../.cache_bencina/respaldo.json", "/media/respaldo.json"):
             self.assertEqual(c.get(ruta).status_code, 404, ruta)
+
+
+class CredencialesEnLogsTests(ConCache):
+    CLAVES = ("secreta", "p@ss", "tok123", "usuario")
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch("viajes.bencina.API_BASE", "http://usuario:p@ss-secreta@api.ejemplo.cl/api?token=tok123")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def revisar(self, d, logs):
+        texto = d.aviso + "\n" + "\n".join(logs.output)
+        for clave in self.CLAVES:
+            self.assertNotIn(clave, texto, clave)
+        return texto
+
+    def probar(self, **kw):
+        with self.assertLogs("viajes.bencina", "DEBUG") as logs:
+            with mock.patch("viajes.bencina.requests.get", **kw):
+                d = bencina.obtener_datos(forzar=True)
+        return d, logs
+
+    def test_sanear_textos(self):
+        f = bencina._sin_credenciales
+        self.assertEqual(f("http://u:p@ss@host/x"), "http://***@host/x")
+        self.assertEqual(f("https://u:p@h:8080/a?b=1"), "https://***@h:8080/a?b=1")
+        self.assertEqual(f("GET /x?api_key=abc&z=1 y token=xyz"), "GET /x?api_key=***&z=1 y token=***")
+        self.assertEqual(f("sin credenciales https://host/api"), "sin credenciales https://host/api")
+
+    def test_http_con_url_con_credenciales(self):
+        class R(RespuestaFalsa):
+            url = "http://usuario:p@ss-secreta@api.ejemplo.cl/api/x?token=tok123"
+
+            def raise_for_status(self):
+                raise requests.HTTPError("403 Client Error: Forbidden for url: " + self.url, response=self)
+
+        r = R(None, status=403)
+        r.text = "denegado para http://usuario:p@ss-secreta@api.ejemplo.cl con token=tok123"
+        d, logs = self.probar(return_value=r)
+        texto = self.revisar(d, logs)
+        self.assertIn("403", texto)  # el diagnóstico útil se conserva
+
+    def test_respuesta_no_json_demasiado_grande_y_errores_de_conexion(self):
+        for kw in (
+            {"return_value": RespuestaFalsa(cuerpo=b"<html>http://usuario:p@ss-secreta@x token=tok123</html>")},
+            {"return_value": RespuestaFalsa(cuerpo=b"x" * 5000)},
+            {"side_effect": requests.ConnectionError("fallo http://usuario:p@ss-secreta@api.ejemplo.cl/api?token=tok123")},
+            {"side_effect": requests.Timeout("lento http://usuario:p@ss-secreta@api.ejemplo.cl")},
+            {"side_effect": requests.exceptions.SSLError("certificate has expired http://usuario:p@ss-secreta@api.ejemplo.cl")},
+            {"side_effect": requests.RequestException("raro http://usuario:p@ss-secreta@api.ejemplo.cl")},
+        ):
+            with mock.patch("viajes.bencina.MAX_BYTES", 1000):
+                d, logs = self.probar(**kw)
+            self.revisar(d, logs)
+
+    def test_marcas_que_fallan_con_credenciales_en_el_mensaje(self):
+        def get(url, **k):
+            if url.endswith("marca_ciudadano"):
+                raise requests.ConnectionError("fallo http://usuario:p@ss-secreta@api.ejemplo.cl/marca?token=tok123")
+            return api_falsa()(url, **k)
+
+        d, logs = self.probar(side_effect=get)
+        self.revisar(d, logs)
+        self.assertTrue(d.ok)
