@@ -1,12 +1,14 @@
+import hashlib
 import json
-from datetime import datetime
+from datetime import date, datetime
 from unittest import mock
 
 import requests
+from django.test import Client
 
 from viajes import bencina
 
-from .base import ConCache, RespuestaFalsa, api_falsa, cargar_muestra
+from .base import AHORA_RX, INICIAL, ConCache, ConRx, RespuestaFalsa, api_falsa, cargar_muestra, cargar_rx, rx_falsa
 
 
 def estacion_por_id(datos, id_):
@@ -745,3 +747,663 @@ class CredencialesEnLogsTests(ConCache):
         d, logs = self.probar(side_effect=get)
         self.revisar(d, logs)
         self.assertTrue(d.ok)
+
+
+# =====================================================================================================================
+# Fuente RX Noticias (combustible.json). Todas estas pruebas son LOCALES: usan el archivo real recibido (viajes/data/
+# combustible_inicial.json, generado el 2026-11-01 08:30 UTC) y respuestas simuladas; ninguna toca rxnoticias.com ni Nominatim.
+# =====================================================================================================================
+TABLA_REAL = bencina._tabla_coordenadas  # la función real, antes de que las pruebas la sustituyan
+AMBAR = ("02101", "ARAMCO", "Av. Antonio Rendic 6850")  # Antofagasta; 93/95/97 del 29-oct y diésel del 23-oct
+
+
+def huella(ruta):
+    return hashlib.sha256(ruta.read_bytes()).hexdigest()
+
+
+def con_generado(contenido, generado):
+    contenido["generado"] = generado
+    return contenido
+
+
+def sumar_a_precios(contenido, n=100):
+    for c in contenido["comunas"]:
+        for e in c["estaciones"]:
+            for p in e["precios"].values():
+                p["precio"] += n
+    return contenido
+
+
+def estaciones_crudas(contenido):
+    return [(c, e) for c in contenido["comunas"] for e in c["estaciones"]]
+
+
+def por_clave(estaciones):
+    return {e["extra"]["clave"]: e for e in estaciones}
+
+
+class RxLecturaTests(ConRx):
+    """1-7 y 16: lectura del archivo real, normalización, claves, coordenadas, precios antiguos y atípicos."""
+
+    def test_lee_el_json_completo(self):
+        raw = cargar_rx()
+        estaciones, descartados, generado = bencina.normalizar_rx(raw)
+        self.assertEqual(len(raw["comunas"]), 314)
+        self.assertEqual(len(estaciones_crudas(raw)), 1768)
+        self.assertEqual(sum(len(e["precios"]) for _, e in estaciones_crudas(raw)), 7803)
+        self.assertEqual(len(estaciones), 1768)
+        self.assertEqual(generado, datetime(2026, 11, 1, 8, 30, 52))
+        self.assertEqual(sum(len(e["combustibles"]) for e in estaciones) + descartados["precio_atipico"], 7803)
+
+    def test_normaliza_estacion_y_combustibles(self):
+        est = por_clave(bencina.normalizar_rx(cargar_rx())[0])[bencina.clave_estacion(*AMBAR)]
+        self.assertEqual(set(est), {"id", "marca", "region", "comuna", "direccion", "lat", "lon", "precios", "combustibles", "extra"})
+        self.assertEqual((est["marca"], est["region"], est["comuna"], est["direccion"]), ("ARAMCO", "Antofagasta", "Antofagasta", "Av. Antonio Rendic 6850"))
+        self.assertEqual(est["precios"], {
+            "93": {"precio": 1661.0, "fecha": "2026-10-29", "atencion": "Asistido"},
+            "95": {"precio": 1694.0, "fecha": "2026-10-29", "atencion": "Asistido"},
+            "97": {"precio": 1722.0, "fecha": "2026-10-29", "atencion": "Asistido"},
+        })
+        di = next(c for c in est["combustibles"] if c["codigo"] == "DI")  # el diésel no está en `precios` pero sí se conserva
+        self.assertEqual((di["nombre"], di["precio"], di["fecha"], di["unidad"]), ("Diésel", 1654.0, "2026-10-23", "$/L"))
+        self.assertEqual({c["codigo"] for c in est["combustibles"]}, {"93", "95", "97", "DI"})
+        todos = {c["codigo"] for e in bencina.normalizar_rx(cargar_rx())[0] for c in e["combustibles"]}
+        self.assertEqual(todos, {"93", "95", "97", "DI", "KE"})
+
+    def test_autoservicio_y_asistido(self):
+        raw = cargar_rx()
+        _, e = next((c, e) for c, e in estaciones_crudas(raw) if any(p["autoservicio"] for p in e["precios"].values()))
+        est = por_clave(bencina.normalizar_rx(raw)[0])
+        clave = next(k for k, v in est.items() if v["direccion"] == e["direccion"] and v["marca"] == e["marca"])
+        k_auto = next(k for k, p in e["precios"].items() if p["autoservicio"])
+        self.assertTrue(any(c["codigo"] == k_auto and c["atencion"] == "AutoServicio" for c in est[clave]["combustibles"]))
+
+    def test_id_interno_estable_unico_y_con_clave(self):
+        a, b = bencina.normalizar_rx(cargar_rx())[0], bencina.normalizar_rx(cargar_rx())[0]
+        self.assertEqual([e["id"] for e in a], [e["id"] for e in b])
+        self.assertEqual(len({e["id"] for e in a}), 1768)
+        self.assertTrue(all(e["id"].startswith("rx") and len(e["id"]) == 14 for e in a))
+        self.assertEqual(len({e["extra"]["clave"] for e in a}), 1768)
+        raw = cargar_rx()
+        _, e = estaciones_crudas(raw)[0]
+        antes = a[0]["id"]
+        e["direccion"] += " Bis"  # una dirección distinta es, para este id, otra estación (límite conocido)
+        self.assertNotEqual(bencina.normalizar_rx(raw)[0][0]["id"], antes)
+
+    def test_normalizacion_de_la_clave(self):
+        base = bencina.clave_estacion("02101", "COPEC", "AV ANTONIO RENDIC 6850")
+        self.assertEqual(bencina.clave_estacion(" 02101 ", "Copec", "Av.  Antonio Rendic 6850,"), base)
+        self.assertEqual(bencina.clave_estacion("02101", "copec", "ÁV. ANTONIO RÉNDIC, 6850"), base)
+        self.assertEqual(bencina.clave_estacion("13101", "Shell", "Av. Peñalolén-Sur 10"), bencina.clave_estacion("13101", "SHELL", "AV PENALOLEN SUR 10"))
+        # no se unen estaciones distintas
+        for otra in (("02201", "COPEC", "AV ANTONIO RENDIC 6850"), ("02101", "SHELL", "AV ANTONIO RENDIC 6850"), ("02101", "COPEC", "AV ANTONIO RENDIC 6851")):
+            self.assertNotEqual(bencina.clave_estacion(*otra), base)
+        self.assertNotEqual(bencina.clave_estacion("1", "A", "KM 5,5"), bencina.clave_estacion("1", "A", "KM 55"))
+
+    def test_coordenadas_recuperadas_de_la_tabla(self):
+        estaciones, descartados, _ = bencina.normalizar_rx(cargar_rx())
+        self.assertTrue(all(e["lat"] is not None and e["lon"] is not None for e in estaciones))
+        self.assertNotIn("sin_coordenadas", descartados)
+        self.assertNotIn("coordenada_dudosa", descartados)
+        self.assertTrue(all(-56.5 <= e["lat"] <= -17 and -110 <= e["lon"] <= -66 for e in estaciones))
+        est = por_clave(estaciones)[bencina.clave_estacion(*AMBAR)]
+        self.assertAlmostEqual(est["lat"], -23.609271, 5)
+        self.assertAlmostEqual(est["lon"], -70.384434, 5)
+
+    def test_estacion_sin_coincidencia_se_conserva_sin_coordenadas(self):
+        raw = cargar_rx()
+        c, e = next((c, e) for c, e in estaciones_crudas(raw) if e["direccion"] == AMBAR[2])
+        e["direccion"] = "Calle que no está en la tabla 123"
+        estaciones, descartados, _ = bencina.normalizar_rx(raw)
+        est = next(x for x in estaciones if x["direccion"] == e["direccion"])
+        self.assertEqual((est["lat"], est["lon"]), (None, None))
+        self.assertEqual(est["precios"]["93"]["precio"], 1661.0)  # sigue con sus precios
+        self.assertEqual((len(estaciones), descartados["sin_coordenadas"]), (1768, 1))
+
+    def test_claves_repetidas_no_reciben_coordenadas(self):
+        raw = cargar_rx()
+        c = next(c for c in raw["comunas"] if c["comuna"] == "Antofagasta")
+        c["estaciones"].append(json.loads(json.dumps(next(e for e in c["estaciones"] if e["direccion"] == AMBAR[2]))))
+        estaciones, descartados, _ = bencina.normalizar_rx(raw)
+        iguales = [e for e in estaciones if e["extra"]["clave"] == bencina.clave_estacion(*AMBAR)]
+        self.assertEqual(len(iguales), 2)
+        self.assertEqual(len({e["id"] for e in iguales}), 2)
+        self.assertTrue(all(e["lat"] is None for e in iguales))
+        self.assertEqual(descartados["clave_repetida"], 2)
+
+    def test_coordenada_que_no_corresponde_a_la_comuna_se_descarta(self):
+        tabla = bencina._tabla_coordenadas()
+        clave = bencina.clave_estacion(*AMBAR)
+        tabla[clave] = (-53.16, -70.91)  # Punta Arenas, a 2.000 km de Antofagasta
+        with mock.patch("viajes.bencina._tabla_coordenadas", return_value=tabla):
+            estaciones, descartados, _ = bencina.normalizar_rx(cargar_rx())
+        self.assertEqual(descartados["coordenada_dudosa"], 1)
+        self.assertIsNone(por_clave(estaciones)[clave]["lat"])
+        self.assertEqual(sum(1 for e in estaciones if e["lat"] is None), 1)  # el resto queda igual
+
+    def test_coordenadas_invalidas_de_la_tabla_no_se_usan(self):
+        tabla = bencina._tabla_coordenadas()
+        clave = bencina.clave_estacion(*AMBAR)
+        tabla[clave] = (0, 0)  # fuera de Chile
+        with mock.patch("viajes.bencina._tabla_coordenadas", return_value=tabla):
+            est = por_clave(bencina.normalizar_rx(cargar_rx())[0])[clave]
+        self.assertIsNone(est["lat"])
+
+    def test_precios_antiguos_se_conservan_con_su_fecha(self):
+        raw = cargar_rx()
+        antiguos = [(c["codigo_comuna"], e["direccion"], k, p["fecha"]) for c, e in estaciones_crudas(raw) for k, p in e["precios"].items()
+                    if (AHORA_RX.date() - date.fromisoformat(p["fecha"])).days > 30]
+        self.assertEqual(len(antiguos), 193)  # los que `vigente: false` marca (ya pasaron 30 días), incluido uno de hace 430 días
+        estaciones = bencina.normalizar_rx(raw)[0]
+        self.assertEqual(len(estaciones), 1768)  # ninguna estación se elimina por tener precios viejos
+        for codigo, direccion, k, fecha in antiguos:
+            est = next(e for e in estaciones if e["extra"]["codigo_comuna"] == codigo and e["direccion"] == direccion)
+            self.assertIn((k, fecha), [(c["codigo"], c["fecha"]) for c in est["combustibles"]])
+        viejo = min(c["fecha"] for e in estaciones for c in e["combustibles"])
+        self.assertEqual(viejo, "2025-08-28")
+        sin_vigentes = [e for c, e in estaciones_crudas(raw) if not any(p["vigente"] for p in e["precios"].values())]
+        self.assertEqual(len(sin_vigentes), 37)  # estaciones sin ningún precio vigente: igual salen
+        self.assertTrue(all(e["combustibles"] for e in estaciones))
+
+    def test_precio_atipico_se_descarta(self):
+        raw = cargar_rx()
+        estaciones, descartados, _ = bencina.normalizar_rx(raw)
+        self.assertEqual(descartados, {"precio_atipico": 1})
+        est = next(e for e in estaciones if e["comuna"] == "Peñalolén" and e["direccion"] == "Avda. Consistorial 5410" and e["marca"] == "ECCO")
+        self.assertNotIn("KE", [c["codigo"] for c in est["combustibles"]])  # el kerosene de valor 1
+        self.assertTrue(est["precios"])  # la estación y sus otros precios siguen
+
+    def test_precios_invalidos_y_fechas_ausentes(self):
+        raw = cargar_rx()
+        _, e = next((c, e) for c, e in estaciones_crudas(raw) if e["direccion"] == AMBAR[2])
+        e["precios"]["93"]["precio"] = 99999
+        e["precios"]["95"]["precio"] = "abc"
+        e["precios"]["97"].pop("fecha")
+        e["precios"]["DI"]["fecha"] = "no-es-fecha"
+        est = por_clave(bencina.normalizar_rx(raw)[0])[bencina.clave_estacion(*AMBAR)]
+        self.assertEqual(set(est["precios"]), {"97"})
+        self.assertIsNone(est["precios"]["97"]["fecha"])  # no se inventa una fecha
+        self.assertIsNone(next(c for c in est["combustibles"] if c["codigo"] == "DI")["fecha"])
+
+    def test_estructuras_inutilizables(self):
+        casos = {
+            "lista": [], "texto": "hola", "sin comunas": {"generado": "2026-11-01T08:00:00+00:00"},
+            "comunas vacías": {"generado": "2026-11-01T08:00:00+00:00", "comunas": []},
+            "sin generado": {"comunas": cargar_rx()["comunas"]},
+            "generado inválido": {"generado": "ayer", "comunas": cargar_rx()["comunas"]},
+            "generado en el futuro": {"generado": "2026-12-31T08:00:00+00:00", "comunas": cargar_rx()["comunas"]},
+            "estaciones sin dirección": {"generado": "2026-11-01T08:00:00+00:00", "comunas": [{"comuna": "X", "codigo_comuna": "1", "estaciones": [{"marca": "A", "precios": {}}]}]},
+        }
+        for nombre, contenido in casos.items():
+            with self.subTest(nombre), self.assertRaises(ValueError):
+                bencina.normalizar_rx(contenido)
+
+    def test_generado_con_zona_horaria_se_lleva_a_utc(self):
+        self.assertEqual(bencina._fecha_utc("2026-11-01T05:30:52-03:00"), datetime(2026, 11, 1, 8, 30, 52))
+        self.assertEqual(bencina._fecha_utc("2026-11-01T08:30:52Z"), datetime(2026, 11, 1, 8, 30, 52))
+        self.assertIsNone(bencina._fecha_utc("nada"))
+
+
+class RxDescargaTests(ConRx):
+    """8-15 y 17: descarga, respaldo y recuperación, con respuestas simuladas."""
+
+    def bajar(self, contenido=None, **kw):
+        with mock.patch("viajes.bencina.requests.get", side_effect=rx_falsa(contenido, **kw)):
+            return bencina.obtener_datos(forzar=True)
+
+    def caida(self, exc):
+        with mock.patch("viajes.bencina.requests.get", side_effect=exc):
+            return bencina.obtener_datos(forzar=True)
+
+    def doc(self, previo=False):
+        return json.loads(bencina._ruta_respaldo(previo).read_text(encoding="utf-8"))
+
+    def reiniciar(self):  # cerrar y abrir Django: se pierde la memoria, queda el disco
+        bencina.cache.clear()
+        bencina._memo.clear()
+
+    def comprobar_conserva(self, d, huella_antes, n=1768):
+        self.assertEqual(d.fuente, "respaldo")
+        self.assertEqual(len(d.estaciones), n)
+        self.assertTrue(d.ok)
+        self.assertEqual(huella(bencina._ruta_respaldo()), huella_antes)  # el respaldo no se tocó
+
+    def test_la_url_y_la_peticion(self):
+        self.assertEqual(bencina.FUENTE_URL, "https://rxnoticias.com/datos/combustible.json")
+        with mock.patch("viajes.bencina.requests.get", side_effect=rx_falsa()) as get:
+            bencina.obtener_datos(forzar=True)
+        self.assertEqual(get.call_count, 1)
+        kw = get.call_args.kwargs
+        self.assertEqual(get.call_args.args[0], "https://rxnoticias.com/datos/combustible.json")
+        self.assertIs(kw["verify"], True)  # TLS verificado
+        self.assertEqual(kw["timeout"], bencina.TIMEOUT)
+        self.assertTrue(kw["stream"])
+        self.assertIn("proyectobencina", kw["headers"]["User-Agent"])
+
+    def test_primera_descarga_guarda_el_respaldo(self):
+        d = self.bajar()
+        self.assertEqual((d.fuente, len(d.estaciones), d.generado), ("rx", 1768, datetime(2026, 11, 1, 8, 30, 52)))
+        doc = self.doc()
+        self.assertEqual((doc["version"], doc["fuente"], doc["generado"]), (1, "rx", "2026-11-01T08:30:52"))
+        self.assertEqual(len(doc["estaciones"]), 1768)
+        self.assertEqual(doc["crudo"]["rx"]["generado"], "2026-11-01T08:30:52+00:00")  # el archivo original
+        self.assertEqual(doc["endpoints"]["combustible.json"], {"ok": True, "n": 1768})
+        self.assertFalse(bencina._ruta_respaldo(previo=True).exists())
+
+    def test_descargas_defectuosas_conservan_el_ultimo_respaldo(self):
+        self.bajar()
+        antes = huella(bencina._ruta_respaldo())
+        raw = json.dumps(cargar_rx(), ensure_ascii=False).encode()
+        casos = {
+            "archivo vacío": RespuestaFalsa(cuerpo=b""),
+            "corrupto": RespuestaFalsa(cuerpo=b'{"generado": "2026-11-02T08:30:52+00:00", "comunas": [{{{'),
+            "truncado": RespuestaFalsa(cuerpo=raw[: len(raw) // 2]),
+            "HTML en vez de JSON": RespuestaFalsa(json_invalido=True),
+            "HTML de error 502": RespuestaFalsa(cuerpo=b"<html>502 Bad Gateway</html>", status=502),
+            "HTTP 403": RespuestaFalsa({"error": "no"}, status=403),
+            "JSON de otro tipo": RespuestaFalsa([1, 2, 3]),
+            "sin comunas": RespuestaFalsa(con_generado({"comunas": []}, "2026-11-02T08:30:52+00:00")),
+            "demasiado grande": RespuestaFalsa(cuerpo=raw),
+        }
+        for nombre, respuesta in casos.items():
+            with self.subTest(nombre):
+                self.reiniciar()
+                with mock.patch("viajes.bencina.MAX_BYTES", 1000 if nombre == "demasiado grande" else bencina.MAX_BYTES):
+                    d = self.bajar(respuesta)
+                self.comprobar_conserva(d, antes)
+                self.assertIn("RX Noticias", d.aviso)
+
+    def test_errores_de_conexion_y_timeout_conservan_el_respaldo(self):
+        self.bajar()
+        antes = huella(bencina._ruta_respaldo())
+        for exc in (requests.ConnectionError("sin red"), requests.Timeout(), requests.exceptions.SSLError("certificate has expired"),
+                    requests.exceptions.ChunkedEncodingError("cortado")):
+            with self.subTest(type(exc).__name__):
+                self.reiniciar()
+                self.comprobar_conserva(self.caida(exc), antes)
+
+    def test_timeout_y_certificado_se_explican(self):
+        self.assertIn("no respondió", self.caida(requests.Timeout()).aviso)
+        d = self.caida(requests.exceptions.SSLError("certificate has expired"))
+        self.assertIn("certificado TLS", d.aviso)
+        self.assertIn("no se desactiva", d.aviso)
+
+    def test_generado_mas_antiguo_no_reemplaza(self):
+        self.bajar()
+        antes = huella(bencina._ruta_respaldo())
+        self.reiniciar()
+        viejo = sumar_a_precios(con_generado(cargar_rx(), "2026-10-30T08:30:52+00:00"))
+        d = self.bajar(viejo)
+        self.comprobar_conserva(d, antes)
+        self.assertIn("más antiguo", d.aviso)
+        self.assertEqual(por_clave(d.estaciones)[bencina.clave_estacion(*AMBAR)]["precios"]["93"]["precio"], 1661.0)  # no los +100
+
+    def test_mismo_generado_no_reemplaza(self):
+        self.bajar()
+        antes = huella(bencina._ruta_respaldo())
+        self.reiniciar()
+        igual = sumar_a_precios(cargar_rx())  # mismo `generado` pero precios distintos: no se toma
+        d = self.bajar(igual)
+        self.assertEqual((d.fuente, len(d.estaciones)), ("rx", 1768))  # la fuente respondió; simplemente no hay novedades
+        self.assertEqual(por_clave(d.estaciones)[bencina.clave_estacion(*AMBAR)]["precios"]["93"]["precio"], 1661.0)
+        self.assertEqual(huella(bencina._ruta_respaldo()), antes)
+        self.assertFalse(bencina._ruta_respaldo(previo=True).exists())
+
+    def test_generado_posterior_actualiza_y_rota_la_copia(self):
+        self.bajar()
+        self.reiniciar()
+        nuevo = sumar_a_precios(con_generado(cargar_rx(), "2026-11-02T08:30:52+00:00"))
+        with mock.patch("viajes.bencina.ahora", return_value=datetime(2026, 11, 2, 12)):
+            d = self.bajar(nuevo)
+        self.assertEqual((d.fuente, d.generado), ("rx", datetime(2026, 11, 2, 8, 30, 52)))
+        self.assertEqual(por_clave(d.estaciones)[bencina.clave_estacion(*AMBAR)]["precios"]["93"]["precio"], 1761.0)
+        self.assertEqual(self.doc()["generado"], "2026-11-02T08:30:52")
+        self.assertEqual(self.doc(previo=True)["generado"], "2026-11-01T08:30:52")  # la anterior sigue guardada
+
+    def test_generado_futuro_no_bloquea_las_actualizaciones_siguientes(self):
+        self.bajar()
+        antes = huella(bencina._ruta_respaldo())
+        self.reiniciar()
+        d = self.bajar(con_generado(cargar_rx(), "2030-01-01T00:00:00+00:00"))
+        self.comprobar_conserva(d, antes)
+        self.assertEqual(self.doc()["generado"], "2026-11-01T08:30:52")
+
+    def test_descarga_incompleta_no_pisa_la_copia_buena(self):
+        self.bajar()
+        antes = huella(bencina._ruta_respaldo())
+        recortada = con_generado(cargar_rx(), "2026-11-02T08:30:52+00:00")
+        recortada["comunas"] = recortada["comunas"][:5]
+        self.reiniciar()
+        with mock.patch("viajes.bencina.ahora", return_value=datetime(2026, 11, 2, 12)):
+            d = self.bajar(recortada)
+        self.comprobar_conserva(d, antes)
+        self.assertIn("incompleta", d.aviso)
+        sin_precios = con_generado(cargar_rx(), "2026-11-02T08:30:52+00:00")
+        for _, e in estaciones_crudas(sin_precios)[:1200]:
+            e["precios"] = {}
+        self.reiniciar()
+        with mock.patch("viajes.bencina.ahora", return_value=datetime(2026, 11, 2, 12)):
+            self.comprobar_conserva(self.bajar(sin_precios), antes)
+
+    def test_sobrevive_al_reinicio_y_no_caduca(self):
+        self.bajar()
+        self.reiniciar()
+        with mock.patch("viajes.bencina.ahora", return_value=datetime(2027, 12, 31)):  # más de un año después
+            d = self.caida(requests.ConnectionError("sin red"))
+        self.assertEqual((d.fuente, len(d.estaciones), d.generado), ("respaldo", 1768, datetime(2026, 11, 1, 8, 30, 52)))
+        self.assertEqual(sum(1 for e in d.estaciones if e["precios"]), 1751)  # los precios viejos se muestran, no se descartan
+
+    def test_respaldo_danado_usa_la_copia_previa(self):
+        self.bajar()
+        self.reiniciar()
+        self.bajar(sumar_a_precios(con_generado(cargar_rx(), "2026-11-01T10:00:00+00:00")))
+        bencina._ruta_respaldo().write_text("{ roto", encoding="utf-8")
+        self.reiniciar()
+        d = self.caida(requests.ConnectionError("sin red"))
+        self.assertEqual((d.fuente, len(d.estaciones), d.generado), ("respaldo", 1768, datetime(2026, 11, 1, 8, 30, 52)))
+        self.assertEqual(bencina._ruta_respaldo().read_text(encoding="utf-8"), "{ roto")  # y no se borró
+
+    def test_sin_respaldo_y_sin_descarga_se_usan_los_datos_que_vienen_con_el_proyecto(self):
+        d = self.caida(requests.ConnectionError("sin red"))
+        self.assertEqual((d.fuente, len(d.estaciones), d.generado), ("respaldo", 1768, datetime(2026, 11, 1, 8, 30, 52)))
+        self.assertIn("vienen con el proyecto", d.aviso)
+        self.assertFalse(bencina._ruta_respaldo().exists())  # no se hace pasar por una descarga
+        self.assertEqual(min(c["fecha"] for e in d.estaciones for c in e["combustibles"]), "2025-08-28")  # cada precio con su fecha real
+
+    def test_primera_descarga_defectuosa_tambien_cae_en_los_datos_iniciales(self):
+        d = self.bajar(RespuestaFalsa(cuerpo=b"<html>no</html>"))
+        self.assertEqual((d.fuente, len(d.estaciones)), ("respaldo", 1768))
+        self.assertFalse(bencina._ruta_respaldo().exists())
+
+    def test_sin_nada_el_mensaje_es_claro_y_no_lanza_errores(self):
+        with mock.patch("viajes.bencina.ARCHIVO_INICIAL", self.carpeta / "no-existe.json"):
+            d = self.caida(requests.ConnectionError("sin red"))
+        self.assertFalse(d.ok)
+        self.assertIn("No hay precios guardados", d.aviso)
+
+    def test_datos_iniciales_danados_no_rompen(self):
+        malo = self.carpeta / "inicial.json"
+        malo.write_text("{ roto", encoding="utf-8")
+        with mock.patch("viajes.bencina.ARCHIVO_INICIAL", malo):
+            self.assertFalse(self.caida(requests.ConnectionError("sin red")).ok)
+        malo.write_text('{"generado": "2026-11-01T00:00:00+00:00", "comunas": []}', encoding="utf-8")
+        bencina._memo.clear()
+        with mock.patch("viajes.bencina.ARCHIVO_INICIAL", malo):
+            self.assertFalse(self.caida(requests.ConnectionError("sin red")).ok)
+
+    def test_tras_un_fallo_no_se_reintenta_de_inmediato(self):
+        with mock.patch("viajes.bencina.requests.get", side_effect=requests.ConnectionError("sin red")) as get:
+            bencina.obtener_datos()
+            bencina.obtener_datos()
+        self.assertEqual(get.call_count, 1)
+
+    def test_la_descarga_nueva_se_recupera_despues_de_un_fallo(self):
+        self.caida(requests.ConnectionError("sin red"))
+        self.reiniciar()
+        self.assertEqual(self.bajar().fuente, "rx")
+        self.assertTrue(bencina._ruta_respaldo().exists())
+
+    def test_las_coordenadas_de_la_copia_anterior_se_reutilizan(self):
+        self.bajar()
+        self.reiniciar()
+        with mock.patch("viajes.bencina._tabla_coordenadas", return_value={}):  # sin tabla: solo queda lo ya guardado
+            d = self.bajar(con_generado(cargar_rx(), "2026-11-01T10:00:00+00:00"))
+        self.assertEqual(sum(1 for e in d.estaciones if e["lat"] is not None), 1768)
+
+    def test_sin_tabla_ni_copia_la_pagina_sigue_con_precios_pero_sin_mapa(self):
+        with mock.patch("viajes.bencina._tabla_coordenadas", return_value={}):
+            d = self.bajar()
+        self.assertEqual(len(d.estaciones), 1768)
+        self.assertTrue(all(e["lat"] is None and e["precios"] is not None for e in d.estaciones))
+        self.assertEqual(d.descartados["sin_coordenadas"], 1768)
+        self.assertIn("no tienen coordenadas", d.aviso)
+        self.assertTrue(bencina._ruta_respaldo().exists())
+
+    def test_combustibles_que_rx_no_entrega_se_conservan_desde_la_copia_anterior(self):
+        estaciones, descartados, _ = bencina.normalizar_rx(cargar_rx())
+        glp = {"codigo": "GLP", "nombre": "GLP vehicular", "atencion": "AutoServicio", "unidad": "$/L", "precio": 905.0, "fecha": "2026-10-20 10:00:00", "extra": {}}
+        gnc = {"codigo": "GNC", "nombre": "GNC", "atencion": "AutoServicio", "unidad": "$/m3", "precio": 780.0, "fecha": "2026-10-21 10:00:00", "extra": {}}
+        viejo_93 = {"codigo": "A93", "nombre": "Gasolina 93", "atencion": "Asistido", "unidad": "$/L", "precio": 1.0, "fecha": "2026-01-01", "extra": {}}
+        clave = bencina.clave_estacion(*AMBAR)
+        # copia anterior tal como la dejó la versión con la API: id numérico, sin `generado`, sin código de comuna
+        anterior = [dict(e, id=i, extra={}) for i, e in enumerate(estaciones)]
+        est = next(e for e in anterior if e["id"] == next(i for i, x in enumerate(estaciones) if x["extra"]["clave"] == clave))
+        est["combustibles"] = est["combustibles"] + [glp, gnc, viejo_93]
+        doc = {"version": 1, "descargado": "2026-10-31T12:00:00", "completa": True, "estaciones": anterior, "descartados": {}}
+        self.assertTrue(bencina._guardar_respaldo(doc))
+        d = self.bajar()
+        self.assertEqual(d.fuente, "rx")
+        nueva = por_clave(d.estaciones)[clave]
+        codigos = [c["codigo"] for c in nueva["combustibles"]]
+        self.assertEqual(sorted(codigos), ["93", "95", "97", "DI", "GLP", "GNC"])  # GLP y GNC se conservan; el A93 viejo lo reemplaza RX
+        glp_nuevo = next(c for c in nueva["combustibles"] if c["codigo"] == "GLP")
+        self.assertEqual((glp_nuevo["precio"], glp_nuevo["fecha"], glp_nuevo["extra"]["origen"]), (905.0, "2026-10-20 10:00:00", "copia anterior"))
+        self.assertEqual(set(nueva["precios"]), {"93", "95", "97"})  # el recomendador sigue viendo solo 93/95/97
+        # y quedan también en el respaldo en disco
+        self.assertIn("GLP", [c["codigo"] for e in self.doc()["estaciones"] if e["extra"].get("clave") == clave for c in e["combustibles"]])
+
+    def test_archivo_local_con_formato_rx(self):
+        with mock.patch("viajes.bencina.ARCHIVO_LOCAL", str(INICIAL)):
+            d = bencina.obtener_datos()
+        self.assertEqual((d.fuente, len(d.estaciones), d.generado), ("archivo", 1768, datetime(2026, 11, 1, 8, 30, 52)))
+
+    def test_la_url_con_credenciales_no_se_muestra_ni_se_registra(self):
+        url = "http://usuario:p@ss-secreta@rxnoticias.com/datos/combustible.json?token=tok123"
+        error = requests.ConnectionError(f"no se pudo conectar con {url}")
+        with mock.patch("viajes.bencina.FUENTE_URL", url), self.assertLogs("viajes.bencina", level="WARNING") as logs:
+            d = self.caida(error)
+        texto = d.aviso + " ".join(logs.output)
+        for secreto in ("secreta", "p@ss", "tok123", "usuario"):
+            self.assertNotIn(secreto, texto)
+
+
+class RxVistasTests(ConRx):
+    """16: el mapa, los filtros y el recomendador reciben los mismos campos de siempre con los datos de RX Noticias."""
+
+    def setUp(self):
+        super().setUp()
+        self.client = Client()
+        p = mock.patch("viajes.bencina.requests.get", side_effect=rx_falsa())
+        self.get = p.start()
+        self.addCleanup(p.stop)
+
+    def pedir(self, **params):
+        r = self.client.get("/estaciones.json", params)
+        self.assertEqual(r.status_code, 200)
+        return r.json()
+
+    def test_estaciones_json_con_los_campos_del_mapa(self):
+        j = self.pedir()
+        self.assertEqual((len(j["estaciones"]), j["total"], j["fuente"], j["completa"]), (1768, 1768, "rx", True))
+        for e in j["estaciones"]:
+            self.assertEqual(set(e), {"id", "marca", "region", "comuna", "direccion", "lat", "lon", "precios"})
+            self.assertIsInstance(e["lat"], float)
+            self.assertIsInstance(e["lon"], float)
+            for comb, p in e["precios"].items():
+                self.assertIn(comb, ("93", "95", "97"))  # lo que el mapa filtra por combustible
+                self.assertEqual(set(p), {"precio", "fecha", "atencion"})
+                self.assertIsInstance(p["precio"], float)
+        self.assertEqual(len(j["regiones"]), 16)
+        self.assertEqual(len(j["comunas"]), 312)  # las 314 del archivo menos 2 que no tienen ninguna estación
+        self.assertIn({"nombre": "Antofagasta", "region": "Antofagasta"}, j["comunas"])
+        self.assertEqual(len({e["id"] for e in j["estaciones"]}), 1768)
+
+    def test_filtros_por_comuna_region_y_texto(self):
+        raw = cargar_rx()
+        en_comuna = lambda nombre: sum(len(c["estaciones"]) for c in raw["comunas"] if c["comuna"] == nombre)
+        self.assertEqual(len(self.pedir(comuna="ANTOFAGASTA")["estaciones"]), en_comuna("Antofagasta"))
+        self.assertEqual(len(self.pedir(comuna="penalolen")["estaciones"]), en_comuna("Peñalolén"))  # sin tildes ni mayúsculas
+        self.assertEqual(len(self.pedir(region="Antofagasta")["estaciones"]), sum(len(c["estaciones"]) for c in raw["comunas"] if c["region"] == "Antofagasta"))
+        aramco = self.pedir(q="aramco")["estaciones"]
+        self.assertEqual(len(aramco), 301)
+        self.assertTrue(all(e["marca"] == "ARAMCO" for e in aramco))
+
+    def test_estacion_sin_coordenadas_sale_en_la_lista_con_lat_lon_nulos(self):
+        raw = cargar_rx()
+        _, e = next((c, e) for c, e in estaciones_crudas(raw) if e["direccion"] == AMBAR[2])
+        e["direccion"] = "Dirección desconocida 1"
+        self.get.side_effect = rx_falsa(raw)
+        j = self.pedir()
+        est = next(x for x in j["estaciones"] if x["direccion"] == "Dirección desconocida 1")
+        self.assertEqual((est["lat"], est["lon"]), (None, None))  # mapa.js la omite del mapa pero no del resto
+        self.assertEqual(len(j["estaciones"]), 1768)
+        self.assertIn("1 estaciones no tienen coordenadas", j["aviso"])
+
+    def test_el_recomendador_usa_los_precios_de_rx(self):
+        r = self.client.post("/", {"accion": "recomendar", "vehiculo": "Kia Soluto 1.4", "km_mes": "800", "comuna": ""})
+        self.assertContains(r, "Recomendado para tu Kia Soluto 1.4")
+        rec = r.context["resultado"]["recomendado"]
+        self.assertIn(rec["combustible"], ("93", "95", "97"))
+        self.assertRegex(rec["fecha_txt"], r"^\d{4}-\d{2}-\d{2}$")  # la fecha propia del precio, sin hora inventada
+        self.assertEqual(r.context["resultado"]["n_estaciones"], 1768)
+        self.assertContains(r, "RX Noticias")
+        self.assertContains(r, "CC BY 4.0")
+
+    def test_con_la_fuente_caida_la_pagina_y_el_mapa_siguen_con_datos(self):
+        self.pedir()  # primera descarga: guarda el respaldo
+        bencina.cache.clear()
+        self.get.side_effect = requests.ConnectionError("sin red")
+        j = self.pedir()
+        self.assertEqual((j["fuente"], len(j["estaciones"])), ("respaldo", 1768))
+        self.assertIn("RX Noticias", j["aviso"])
+        r = self.client.post("/", {"accion": "recomendar", "vehiculo": "Kia Soluto 1.4", "km_mes": "800", "comuna": ""})
+        self.assertContains(r, "Datos guardados, no son precios actuales")
+        self.assertContains(r, "Recomendado para tu Kia Soluto 1.4")
+
+    def test_sin_copia_y_sin_fuente_el_mapa_usa_los_datos_del_proyecto(self):
+        self.get.side_effect = requests.ConnectionError("sin red")
+        j = self.pedir()
+        self.assertEqual((j["fuente"], len(j["estaciones"])), ("respaldo", 1768))
+
+    def test_los_combustibles_extra_no_llegan_al_mapa(self):
+        for e in self.pedir()["estaciones"]:
+            self.assertNotIn("combustibles", e)
+            self.assertNotIn("extra", e)
+
+
+class NominatimTests(ConRx):
+    """Geocodificación opcional (apagada por defecto): se prueba con respuestas simuladas, nunca contra OpenStreetMap."""
+
+    def setUp(self):
+        super().setUp()
+        self.consultas = []
+        self.dormidas = []
+        for p in (mock.patch("viajes.bencina._tabla_coordenadas", return_value={}),
+                  mock.patch("viajes.bencina.time.sleep", side_effect=self.dormidas.append),
+                  mock.patch("viajes.bencina.requests.get", side_effect=self.responder),
+                  mock.patch("viajes.bencina.NOMINATIM_MAX", 3)):
+            p.start()
+            self.addCleanup(p.stop)
+        self.modo = "bien"
+        self.contenido = cargar_rx()
+
+    def responder(self, url, **kw):
+        if url == bencina.FUENTE_URL:
+            return RespuestaFalsa(self.contenido)
+        self.assertEqual(url, bencina.NOMINATIM_URL)
+        self.consultas.append(kw)
+        if self.modo == "caido":
+            raise requests.ConnectionError("sin red")
+        p = kw["params"]
+        n = p["street"].split()[0]
+        ok = {"lat": "-33.45", "lon": "-70.65", "address": {"country_code": "cl", "house_number": n, "city": p["city"]}}
+        numero = len(self.consultas)
+        if self.modo == "bien":
+            return RespuestaFalsa([ok] if numero == 1 else [ok, dict(ok, lat="-33.46")] if numero == 2 else [dict(ok, address=dict(ok["address"], house_number="1"))])
+        return RespuestaFalsa([])
+
+    def bajar(self):
+        return bencina.obtener_datos(forzar=True)
+
+    def test_apagado_por_defecto_no_hace_ninguna_consulta(self):
+        d = self.bajar()
+        self.assertEqual((self.consultas, self.dormidas), ([], []))
+        self.assertEqual(d.descartados["sin_coordenadas"], 1768)
+
+    def test_activo_cumple_la_politica_y_solo_acepta_coincidencias_claras(self):
+        with mock.patch("viajes.bencina.NOMINATIM_ACTIVO", True), mock.patch("viajes.bencina.NOMINATIM_CONTACTO", "equipo@example.cl"):
+            d = self.bajar()
+        self.assertEqual(len(self.consultas), 3)  # el máximo por descarga
+        self.assertEqual(len(self.dormidas), 2)  # 1 consulta por segundo como máximo
+        self.assertTrue(all(s >= 1 for s in self.dormidas))
+        kw = self.consultas[0]
+        self.assertIn("proyectobencina", kw["headers"]["User-Agent"])  # se identifica
+        self.assertIn("equipo@example.cl", kw["headers"]["User-Agent"])
+        self.assertIs(kw["verify"], True)
+        self.assertEqual(kw["params"]["country"], "Chile")
+        con = [e for e in d.estaciones if e["lat"] is not None]
+        self.assertEqual(len(con), 1)  # la única coincidencia clara: la ambigua (2 resultados) y la de otro número no se asignan
+        self.assertEqual((con[0]["lat"], con[0]["lon"]), (-33.45, -70.65))
+
+    def test_resultados_se_guardan_y_no_se_repiten_consultas(self):
+        with mock.patch("viajes.bencina.NOMINATIM_ACTIVO", True):
+            self.bajar()
+            primeras = [kw["params"]["street"] + kw["params"]["city"] for kw in self.consultas]
+            doc = json.loads(bencina._ruta_coordenadas().read_text(encoding="utf-8"))
+            self.assertEqual((len(doc["coords"]), len(doc["sin_resultado"])), (1, 2))
+            self.assertEqual(next(iter(doc["coords"].values()))["origen"], "nominatim")
+            self.contenido = con_generado(cargar_rx(), "2026-11-01T10:00:00+00:00")
+            self.modo = "vacio"
+            self.consultas.clear()
+            self.bajar()
+        nuevas = [kw["params"]["street"] + kw["params"]["city"] for kw in self.consultas]
+        self.assertEqual(len(nuevas), 3)
+        self.assertFalse(set(nuevas) & set(primeras))  # ni la encontrada ni las sin resultado se vuelven a pedir
+        self.assertEqual(len(json.loads(bencina._ruta_coordenadas().read_text(encoding="utf-8"))["sin_resultado"]), 5)
+
+    def test_la_coordenada_guardada_se_usa_en_la_descarga_siguiente_sin_consultar(self):
+        with mock.patch("viajes.bencina.NOMINATIM_ACTIVO", True):
+            self.bajar()
+        self.consultas.clear()
+        bencina._memo.clear()
+        # tabla real (semilla + coordenadas.json), con una semilla vacía para ver solo lo que dejó Nominatim
+        with mock.patch("viajes.bencina._tabla_coordenadas", side_effect=TABLA_REAL), \
+                mock.patch("viajes.bencina.ARCHIVO_SEMILLA", self.carpeta / "sin-semilla.json"):
+            estaciones = bencina.normalizar_rx(cargar_rx())[0]
+        self.assertEqual(sum(1 for e in estaciones if e["lat"] is not None), 1)
+        self.assertEqual(self.consultas, [])
+
+    def test_la_tabla_une_la_semilla_y_la_cache_y_la_cache_gana(self):
+        semilla = json.loads(bencina.ARCHIVO_SEMILLA.read_text(encoding="utf-8"))["coords"]
+        clave = bencina.clave_estacion(*AMBAR)
+        self.assertEqual(len(semilla), 1808)
+        bencina._ruta_coordenadas().write_text(json.dumps({"version": 1, "coords": {
+            clave: {"lat": -23.5, "lon": -70.4}, "99999|X|Y": {"lat": -33.0, "lon": -70.0}}}), encoding="utf-8")
+        tabla = TABLA_REAL()
+        self.assertEqual(len(tabla), 1809)
+        self.assertEqual(tuple(tabla[clave]), (-23.5, -70.4))  # la caché tiene prioridad sobre la semilla
+        self.assertEqual(tuple(tabla["99999|X|Y"]), (-33.0, -70.0))
+        self.assertEqual(len([k for k in tabla if k != clave and k != "99999|X|Y"]), 1807)  # el resto viene de la semilla
+        bencina._ruta_coordenadas().write_text("{ roto", encoding="utf-8")  # una caché dañada no rompe: queda la semilla
+        bencina._memo.clear()
+        self.assertEqual(len(TABLA_REAL()), 1808)
+
+    def test_un_error_de_red_no_rompe_la_descarga_ni_marca_estaciones(self):
+        self.modo = "caido"
+        with mock.patch("viajes.bencina.NOMINATIM_ACTIVO", True):
+            d = self.bajar()
+        self.assertEqual((d.fuente, len(d.estaciones)), ("rx", 1768))
+        self.assertEqual(len(self.consultas), 1)  # se detiene en el primer error
+        self.assertFalse(bencina._ruta_coordenadas().exists())  # y no marca nada como «sin resultado»
+
+    def test_direcciones_sin_numero_o_de_carretera_no_se_consultan(self):
+        for direccion in ("Ruta 5 Norte Km 570", "Camino Real s/n", "Sin numero alguno", "123"):
+            with self.subTest(direccion):
+                est = {"direccion": direccion, "comuna": "Vallenar", "region": "Atacama"}
+                self.assertIsNone(bencina._geocodificar(est))
+        self.assertEqual(self.consultas, [])
+
+    def test_resultado_de_otro_pais_comuna_o_fuera_de_chile_se_rechaza(self):
+        est = {"direccion": "Av. Siempre Viva 742", "comuna": "Providencia", "region": "Metropolitana"}
+        base = {"lat": "-33.43", "lon": "-70.61", "address": {"country_code": "cl", "house_number": "742", "city": "Providencia"}}
+        casos = {
+            "otro país": dict(base, address=dict(base["address"], country_code="ar")),
+            "otra comuna": dict(base, address=dict(base["address"], city="Las Condes")),
+            "otro número": dict(base, address=dict(base["address"], house_number="7")),
+            "coordenadas fuera de Chile": dict(base, lat="40.4", lon="-3.7"),
+        }
+        for nombre, resultado in casos.items():
+            with self.subTest(nombre), mock.patch("viajes.bencina.requests.get", return_value=RespuestaFalsa([resultado])):
+                self.assertIsNone(bencina._geocodificar(est))
+        with mock.patch("viajes.bencina.requests.get", return_value=RespuestaFalsa([base])):
+            self.assertEqual(bencina._geocodificar(est), (-33.43, -70.61))
