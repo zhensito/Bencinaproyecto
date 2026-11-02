@@ -1,6 +1,6 @@
 # Bencuenta · Recomendador de combustible (Equipo 2 «Los Árabes», IWG400)
 
-**Bencuenta** es una aplicación web en Django que usa **precios reales de bencinas en Chile** (Bencina en Línea, CNE) para decidir qué combustible conviene y cuánto se gasta. «Los Árabes» es el nombre del equipo; la página se llama Bencuenta.
+**Bencuenta** es una aplicación web en Django que usa **precios reales de bencinas en Chile** (RX Noticias, con datos de la CNE / Bencina en Línea) para decidir qué combustible conviene y cuánto se gasta. «Los Árabes» es el nombre del equipo; la página se llama Bencuenta.
 
 ## Funcionalidades
 
@@ -25,7 +25,7 @@
 | Parte | Tecnología |
 |---|---|
 | Servidor | Python y Django (plantillas y vistas; sin base de datos); `requests` para consultar la API |
-| Datos de precios | API pública de Bencina en Línea (CNE), sin token |
+| Datos de precios | `combustible.json` de RX Noticias (datos de la CNE), sin token |
 | Interfaz | HTML, CSS propio (`estilos.css`, con variables de diseño) y JavaScript sin frameworks |
 | Mapa | Leaflet 1.9.4 (desde `unpkg.com`) y mapa base Esri World Street Map (`server.arcgisonline.com`) |
 | Fotos del encabezado | Wikimedia Commons (enlazadas, no incluidas en el proyecto) |
@@ -94,33 +94,55 @@ Para desplegar fuera de tu equipo, la configuración se puede cambiar con variab
 
 La estación que viene repetida en la respuesta de la API (mismo `id`) se cuenta una sola vez. Sin conexión a internet el mapa no carga (Leaflet y los mosaicos son externos), pero el recomendador sí.
 
+## Fuente de datos: RX Noticias
+
+Los precios y estaciones salen de `https://rxnoticias.com/datos/combustible.json` (variable `BENCINA_FUENTE_URL`), que reemplaza a la API de Bencina en Línea (cuyo servidor tuvo el certificado TLS vencido). La ruta heredada de la API sigue en el código solo como opción (`BENCINA_FUENTE=api`) y no se usa por defecto.
+
+**Atribución y licencia.** RX Noticias (2026). *Precios de combustible por comuna*. Fuente de origen: Comisión Nacional de Energía (CNE), publicada en Bencina en Línea. RX Noticias declara licenciar su recopilación (limpieza, orden por comuna y formato) bajo **CC BY 4.0**; los datos de origen son de la CNE y se publican bajo las condiciones de la CNE, que **no verificamos**. Las coordenadas vienen de la tabla del proyecto [diland9/precios-combustibles-chile](https://github.com/diland9/precios-combustibles-chile) (código MIT; datos públicos CNE/SEC; su README pide citar la fuente original).
+
+**Qué trae y qué no.** Por estación: marca, dirección, comuna, región, código de comuna y, por combustible (93, 95, 97, diésel y kerosene), precio, fecha del precio, `vigente` y `autoservicio`. **No trae identificador de estación ni coordenadas, ni GLP ni GNC.** El archivo tiene además `generado` (cuándo lo generó RX Noticias), que **no es la fecha de los precios**: cada precio tiene la suya. `vigente` solo significa «el precio tiene hasta 30 días»; no se usa para descartar nada.
+
+**Cómo se actualiza.** Cada hora (caché de 1 h) se descarga el archivo (con tiempo de espera, límite de tamaño y verificación TLS) y solo reemplaza al respaldo si es válido **y su `generado` es estrictamente posterior** al del respaldo guardado. Si el `generado` es igual, se conserva el respaldo (la fuente respondió, simplemente no hay novedades); si es anterior, se rechaza; una fecha de generación en el futuro (más de un día) también, para que no bloquee las actualizaciones siguientes. Además del `generado`, rigen las validaciones de siempre (mínimo de 10 estaciones, al menos la mitad con precios, sin perder más de la mitad respecto de la copia anterior).
+
+**Si la fuente falla** (sin conexión, timeout, error HTTP, certificado, archivo vacío, corrupto, truncado, HTML en vez de JSON o demasiado grande), la página sigue con el **último respaldo válido**, sin límite de antigüedad y con la fecha de cada precio a la vista. Si no hay respaldo, usa `viajes/data/combustible_inicial.json` (copia del archivo recibido el 1-nov-2026, generado 08:30 UTC), marcado como datos guardados y **no como descarga**. Solo si tampoco existe, la página dice que no hay precios. Los precios viejos **no se eliminan** ni se eliminan estaciones por ello.
+
+**Identificador de estación.** El archivo no tiene uno, así que el `id` interno es `rx` + 12 caracteres de un hash de la clave `código de comuna | marca | dirección`, con la marca y la dirección normalizadas (mayúsculas, sin tildes ni puntuación). **Límite:** si una estación cambia de marca o de dirección, la clave y el `id` cambian y se tratará como otra estación (pierde su coordenada hasta que se vuelva a encontrar). Si dos estaciones comparten clave, se les asigna un `id` distinto y ninguna recibe coordenadas.
+
+**Coordenadas.** Se buscan, en este orden, en: (1) la tabla `viajes/data/coordenadas_semilla.json` (1.808 estaciones del snapshot del 30-10-2026 de diland9) más `.cache_bencina/coordenadas.json` (lo que se vaya guardando, que tiene prioridad); (2) la estación equivalente del respaldo anterior. Se descarta la que cae fuera de Chile o a más de 150 km de la mediana de las demás estaciones de su comuna (se juzga solo con 5 o más). Una estación sin coordenadas **se conserva en los listados y precios** y el mapa la omite; la página avisa cuántas son. Con el archivo del 1-nov-2026, las 1.768 estaciones encontraron coordenadas (prueba local, no contra la fuente real).
+
+**OpenStreetMap (Nominatim), preparado y apagado.** Con `BENCINA_NOMINATIM=1` se consulta Nominatim por las estaciones sin coordenadas, **hasta `BENCINA_NOMINATIM_MAX` (5) por descarga y 1 consulta por segundo**, con `User-Agent` propio (puede incluir `BENCINA_NOMINATIM_CONTACTO`). Solo se acepta una coincidencia clara: dirección con número (no «Km», «Ruta» ni «s/n»), un único resultado en Chile con el mismo número y la misma comuna. Los resultados, también los «sin resultado» (no se repiten antes de 30 días), se guardan en `coordenadas.json`. **No se probó contra OpenStreetMap** desde el entorno de desarrollo.
+
 ## Cómo se manejan los datos
 
-- `viajes/bencina.py` consulta y normaliza la API; `viajes/views.py` solo usa el resultado.
+- `viajes/bencina.py` descarga y normaliza la fuente; `viajes/views.py` solo usa el resultado.
 - **Caché de 1 hora** (en archivo, en `.cache_bencina/cache_django/`, separada del respaldo: limpiar la caché de Django no toca los respaldos). Si una consulta falla no se reintenta durante 60 s.
-- **Respaldo permanente** (`.cache_bencina/respaldo.json`, más `respaldo.previo.json` con la copia anterior). Cada descarga válida lo reescribe de forma atómica (archivo temporal y cambio de nombre, así nunca queda a medias) y **no caduca**: sobrevive a reinicios de Django y del equipo. Guarda la hora de la descarga, si fue completa o parcial y el estado de cada endpoint, las **respuestas originales** de la API (estaciones y marcas) y los **datos normalizados** que usa la aplicación. Además de 93, 95 y 97, conserva todos los combustibles que entrega la API (DI, KE, GNC, A93, A95, A97, ADI…) con su nombre largo, unidad de cobro, fecha y tipo de atención, y cualquier otro campo que venga en cada estación. El recomendador sigue usando solo 93, 95 y 97.
+- **Respaldo permanente** (`.cache_bencina/respaldo.json`, más `respaldo.previo.json` con la copia anterior). Cada descarga válida y más reciente lo reescribe de forma atómica (archivo temporal y cambio de nombre, así nunca queda a medias) y **no caduca**: sobrevive a reinicios de Django y del equipo. Guarda la hora de la descarga, si fue completa o parcial y el estado de cada endpoint, las **respuestas originales** de la API (estaciones y marcas) y los **datos normalizados** que usa la aplicación. Además de 93, 95 y 97, conserva todos los combustibles que entrega la API (DI, KE, GNC, A93, A95, A97, ADI…) con su nombre largo, unidad de cobro, fecha y tipo de atención, y cualquier otro campo que venga en cada estación. El recomendador sigue usando solo 93, 95 y 97.
 - **Límite de tamaño.** Cada respuesta de la API se lee por trozos y se cuentan los bytes realmente recibidos (ya descomprimidos); si pasan de `BENCINA_MAX_BYTES` (25 MB por defecto) se rechaza sin interpretarla como JSON y el respaldo no cambia. Se mantienen el tiempo de espera y la verificación TLS.
 - **Escrituras: qué se garantiza y qué no.** Cada archivo (`respaldo.json` y `respaldo.previo.json`) se escribe en un temporal de nombre único y se publica entero con `os.replace`, así que **nunca queda a medias**; si algo falla, la copia anterior se conserva. Pero la rotación (copiar la copia vigente a `respaldo.previo.json`) y la publicación del archivo nuevo son **dos pasos**, no una única operación atómica, y no hay bloqueo entre procesos (no se justifica para una descarga por hora). Si dos procesos guardan exactamente a la vez, ambos archivos siguen siendo válidos, pero puede quedar como vigente la descarga que terminó de publicar al final aunque no sea la más reciente, y la copia previa puede ser una de las dos versiones anteriores. Si el proceso se cae entre ambos pasos, `respaldo.previo.json` y `respaldo.json` pueden quedar iguales.
 - **Temporales.** Solo se crean (y se limpian) archivos con los nombres `.tmp-resp-*.json` y `.tmp-previo-*.json`. Al guardar se borran los que lleven más de una hora sin modificarse (restos de una caída); los recientes, que podrían ser de una escritura en curso, y cualquier otro archivo de la carpeta no se tocan.
 - **Credenciales en registros y mensajes.** Todo texto que muestra o registra el módulo pasa por un saneado que oculta `usuario:clave@` dentro de una URL (también si la clave contiene `@`) y parámetros como `token=`, `key=` o `password=`; se aplica a las URL, a los mensajes de las excepciones y al comienzo de las respuestas que se registran.
 - **Tiempo de espera.** `BENCINA_TIMEOUT` (15 s) es el tiempo de espera de `requests` **para conectar y para cada lectura**; no es un límite de duración total de la descarga. Una respuesta que llegue con cuentagotas, sin pasar nunca de 15 s entre trozos y sin superar `BENCINA_MAX_BYTES`, podría tardar mucho más. No se agregó un límite total para no complicar el código; mientras tanto, la descarga ocurre una vez por hora y, tras un fallo, no se reintenta durante 60 s.
 - **Protección del respaldo.** Una descarga no reemplaza la copia buena si trae menos de 10 estaciones, si menos de la mitad tiene precios o si pierde más de la mitad de las estaciones (o de las estaciones con precio) de la copia anterior; en ese caso se conserva la copia y el aviso dice por qué. Si falla solo el endpoint de marcas, se reutilizan las de la descarga anterior y la descarga queda marcada como parcial. Un JSON corrupto o ilegible se ignora (se prueba con la copia anterior) sin borrarlo y sin provocar un error 500.
-- **Cuando la API no responde** se muestran los datos guardados con la etiqueta «Datos guardados, no son precios actuales» y la fecha de su última descarga, por antiguos que sean (no se vuelven a filtrar por antigüedad). Sin ninguna copia, la página lo dice y no inventa datos.
-- Se descartan precios fuera de $500–$2.500/L y precios con más de 30 días; las coordenadas con coma decimal se interpretan y las que caen fuera de Chile se ignoran (esa estación queda en la lista, sin marcador). «A93» (asistido) y «93» (autoservicio) se juntan en un solo combustible, con el precio más bajo.
-- Cada estación se identifica por su `id` de la fuente; precios, dirección y coordenadas siempre salen del mismo registro (no se cruzan por nombre).
+- **Cuando la fuente no responde** se muestran los datos guardados con la etiqueta «Datos guardados, no son precios actuales» y la fecha de su última descarga, por antiguos que sean (no se vuelven a filtrar por antigüedad). Sin ninguna copia, la página lo dice y no inventa datos.
+- Se descartan precios fuera de $500–$2.500/L y los marcados `atipico`, pero **no** los antiguos con RX Noticias (la ruta heredada de la API sí descarta los de más de `BENCINA_MAX_DIAS`); las coordenadas con coma decimal se interpretan y las que caen fuera de Chile se ignoran (esa estación queda en la lista, sin marcador). «A93» (asistido) y «93» (autoservicio) se juntan en un solo combustible, con el precio más bajo.
+- Con RX Noticias cada estación se identifica por un `id` interno derivado de su clave (ver arriba); con la ruta heredada, por el `id` de la API.
 
 Variables de entorno opcionales:
 
 | Variable | Por defecto | Para qué |
 |---|---|---|
-| `BENCINA_API_BASE` | `https://api.bencinaenlinea.cl/api` | URL base de la API |
+| `BENCINA_FUENTE` | `rx` | `rx` (RX Noticias) o `api` (ruta heredada de la API de Bencina en Línea) |
+| `BENCINA_FUENTE_URL` | `https://rxnoticias.com/datos/combustible.json` | URL del archivo de RX Noticias |
+| `BENCINA_NOMINATIM` | `0` | `1` activa la geocodificación opcional con Nominatim (ver arriba) |
+| `BENCINA_NOMINATIM_MAX` / `BENCINA_NOMINATIM_CONTACTO` | `5` / vacío | Consultas por descarga y contacto para el `User-Agent` |
+| `BENCINA_API_BASE` | `https://api.bencinaenlinea.cl/api` | URL base de la API (solo con `BENCINA_FUENTE=api`) |
 | `BENCINA_TIMEOUT` | `15` | Segundos de espera por consulta |
 | `BENCINA_VERIFICAR_TLS` | `1` | La verificación TLS está siempre activa por defecto y nunca se desactiva sola. `0` existe solo como **diagnóstico puntual** (la página avisa que la conexión no está verificada) y **no se permite en producción** |
 | `BENCINA_CACHE_SEGUNDOS` | `3600` | Duración de la caché fresca (el respaldo permanente no caduca) |
 | `BENCINA_CACHE_DIR` | `.cache_bencina` | Carpeta del respaldo permanente (la caché de Django va en su subcarpeta `cache_django`) |
 | `BENCINA_MAX_BYTES` | `26214400` | Tamaño máximo (bytes) de una respuesta de la API |
-| `BENCINA_MAX_DIAS` | `30` | Antigüedad máxima de un precio |
-| `BENCINA_JSON_LOCAL` | vacío | Leer un archivo en vez de la API |
+| `BENCINA_MAX_DIAS` | `30` | Antigüedad máxima de un precio (solo con `BENCINA_FUENTE=api`) |
+| `BENCINA_JSON_LOCAL` | vacío | Leer un archivo local (formato de `combustible.json` o de la API) en vez de descargar |
 
 ## Uso de IA
 
@@ -142,7 +164,7 @@ Cómo se verificó el trabajo de la IA: 67 pruebas automáticas (`python manage.
 python manage.py test
 ```
 
-122 pruebas (normalización, selector de marca y modelo, catálogo referencial, caché, errores de red, recomendador, calculadora, filtros y endpoint del mapa). Usan una muestra real guardada en `viajes/tests/fixtures/`, no consultan internet.
+175 pruebas (fuente RX Noticias —lectura, claves, coordenadas, respaldo, vistas y Nominatim—, normalización, selector de marca y modelo, catálogo referencial, caché, errores de red, recomendador, calculadora, filtros y endpoint del mapa). Usan una muestra real guardada en `viajes/tests/fixtures/`, no consultan internet.
 
 ## Catálogo ampliado (datos referenciales)
 
@@ -165,14 +187,19 @@ Cómo se usan:
 
 | Fuente | Estado | Motivo |
 |---|---|---|
-| API de Bencina en Línea (CNE) | **Integrada** | Precios, fecha, tipo de atención y coordenadas por estación, sin token. |
-| [diland9/precios-combustibles-chile](https://github.com/diland9/precios-combustibles-chile) (MIT) | Solo referencia | Confirma los endpoints y los rangos de precio. Su historial por estación empieza el 1-oct-2026. Se usó su snapshot del 26-oct para probar el normalizador con 1.810 estaciones reales; no se copió su código. |
+| `combustible.json` de [RX Noticias](https://rxnoticias.com/datos/) | **Integrada** (fuente por defecto) | Precios con fecha propia por estación y combustible, sin token; CC BY 4.0. Sin id ni coordenadas (ver «Fuente de datos»). **La descarga real desde `rxnoticias.com` no se pudo comprobar** desde el entorno de desarrollo (el proxy la bloquea); se probó con el archivo recibido y con respuestas simuladas. |
+| API de Bencina en Línea (CNE) | Heredada, no por defecto | Su certificado TLS venció el 31-10-2026 y no se desactivó la verificación. Sigue en el código con `BENCINA_FUENTE=api`. |
+| [diland9/precios-combustibles-chile](https://github.com/diland9/precios-combustibles-chile) (MIT) | **Solo coordenadas** | Su snapshot del 30-10-2026 es la tabla inicial de coordenadas. No se usa para precios: se alimenta de la misma API y no tiene datos posteriores al 30-10. No se copió su código. |
 | API de la CNE (`api.cne.cl` / `api.tramites.cne.cl`) | No integrada | No se pudo consultar desde el entorno de desarrollo. `api.cne.cl` declara acceso gratuito con registro. Bencina en Línea es la plataforma de la CNE, así que probablemente ofrece los mismos datos, y hoy no falta ninguno que justifique agregarla. Si se integra, la credencial debe ir en una variable de entorno. |
-| Overpass / OpenStreetMap | No integrada | Las 1.810 estaciones del snapshot traen coordenadas válidas, no hay nada que completar. El mapa base es de Esri (su atribución cita a OpenStreetMap contributors); la página no consulta OSM ni Overpass. |
+| Nominatim (OpenStreetMap) | Preparada, apagada | Para estaciones nuevas sin coordenadas (`BENCINA_NOMINATIM=1`). No probada contra OpenStreetMap. El mapa base es de Esri (su atribución cita a OpenStreetMap contributors). |
+| [0carloscastillo0/stationAPI](https://github.com/0carloscastillo0/stationapi) | Descartada | Es un servidor Flask sobre la misma API de Bencina en Línea; no publica datos propios. |
 
 ## Limitaciones conocidas
 
-- **La API en vivo no pudo probarse desde el entorno donde se desarrolló** (acceso de red restringido). Se validó contra una muestra y un snapshot reales, pero la primera ejecución con internet en tu computador es la verificación real. Si falla, la página lo indica y usa los últimos datos guardados.
+- **La descarga real desde `rxnoticias.com` no se pudo comprobar** desde el entorno donde se desarrolló (el proxy la bloquea). Se probó con el archivo real recibido el 1-nov-2026 y con respuestas simuladas; la primera ejecución con internet en tu computador o en el servidor es la verificación real. No sabemos cada cuánto actualiza RX Noticias (la página no lo declara) ni de dónde obtiene los datos. Si falla, la página lo indica y usa los últimos datos guardados.
+- **Las coordenadas son una tabla fija** (snapshot del 30-10-2026): las estaciones nuevas, o las que cambien de marca o dirección, quedan sin coordenadas (salen en los listados, no en el mapa) hasta que se agreguen a `coordenadas.json` o se active Nominatim, que no se probó contra OpenStreetMap. Nominatim no resuelve bien direcciones de carretera («Km», «Ruta»), que son el 17 % de las direcciones del archivo.
+- **El texto bajo el mapa** («Fuente: Bencina en Línea (CNE)…») está escrito en `mapa.js`, que no se modificó en esta etapa; el resto de la página sí cita a RX Noticias.
+- RX Noticias no entrega GLP ni GNC: si había datos de esos combustibles en un respaldo anterior, se conservan con su fecha original, pero no se actualizan.
 - **Catálogo de autos:** son 33 modelos «de Chile» (rendimiento de Consumo Vehicular, de los fabricantes o de Autocosmos; la fuente se muestra en cada resultado; no todos están verificados) más ~2.000 modelos **referenciales** de otros mercados (ver «Catálogo ampliado»). El **octanaje del fabricante solo está cargado para el Kia Soluto**; para el resto se recomienda el más barato y se avisa.
 - El mapa base es de Esri (World Street Map, con atribución, sin API key). Se descartaron `tile.openstreetmap.org` (bloqueó los mosaicos con 403 en pruebas locales) y CARTO (exige API key). Para un sitio con mucho tráfico habría que revisar las condiciones de uso del proveedor.
 - La lista junto al mapa muestra solo las 15 estaciones más baratas del filtro actual; el mapa dibuja todas las que tienen coordenadas.

@@ -40,6 +40,9 @@ class RespuestaFalsa:
             return b"<html>no es JSON</html>"
         return json.dumps(self._datos).encode()
 
+    def json(self):
+        return self._datos
+
     def iter_content(self, chunk_size=1):
         cuerpo = self._bytes()
         for i in range(0, len(cuerpo), chunk_size):
@@ -71,6 +74,12 @@ class ConCache(SimpleTestCase):
         parche = mock.patch("viajes.bencina.ARCHIVO_LOCAL", "")
         parche.start()
         self.addCleanup(parche.stop)
+        # Las pruebas de esta clase y sus hijas usan la ruta heredada (API directa), sin los datos que vienen con el proyecto.
+        # La fuente por defecto (RX Noticias) se prueba en ConRx.
+        for nombre, valor in (("FUENTE", "api"), ("ARCHIVO_INICIAL", Path(tempfile.gettempdir()) / "no-existe-combustible-inicial.json")):
+            p = mock.patch(f"viajes.bencina.{nombre}", valor)
+            p.start()
+            self.addCleanup(p.stop)
         carpeta = tempfile.TemporaryDirectory(prefix="bencina-prueba-")  # cada prueba con su propio respaldo en disco
         self.addCleanup(carpeta.cleanup)
         self.carpeta = Path(carpeta.name)
@@ -82,3 +91,35 @@ class ConCache(SimpleTestCase):
         reloj.start()
         self.addCleanup(reloj.stop)
         self.addCleanup(cache.clear)
+
+
+# ---------- fuente RX Noticias ----------
+INICIAL = Path(bencina.__file__).parent / "data" / "combustible_inicial.json"
+AHORA_RX = datetime(2026, 11, 1, 12, 0)  # el archivo inicial se generó el 1-nov-2026 a las 08:30 UTC
+
+
+def cargar_rx():
+    """combustible.json de RX Noticias tal como se recibió (1.768 estaciones, 7.803 precios, generado 2026-11-01 08:30 UTC)."""
+    return json.loads(INICIAL.read_text(encoding="utf-8"))
+
+
+def rx_falsa(contenido=None, **kwargs):
+    """Reemplazo de requests.get que responde como rxnoticias.com. `contenido` es un dict (se envía como JSON), o RespuestaFalsa si se quiere otra cosa."""
+    def get(url, **kw):
+        assert url == bencina.FUENTE_URL, f"URL inesperada: {url}"
+        return contenido if isinstance(contenido, RespuestaFalsa) else RespuestaFalsa(contenido if contenido is not None else cargar_rx(), **kwargs)
+    return get
+
+
+class ConRx(ConCache):
+    """Como ConCache pero con la fuente por defecto (RX Noticias), la tabla de coordenadas real y el reloj en el 1-nov-2026."""
+
+    def setUp(self):
+        super().setUp()
+        for nombre, valor in (("FUENTE", "rx"), ("ARCHIVO_INICIAL", INICIAL), ("NOMINATIM_ACTIVO", False)):
+            p = mock.patch(f"viajes.bencina.{nombre}", valor)
+            p.start()
+            self.addCleanup(p.stop)
+        reloj = mock.patch("viajes.bencina.ahora", return_value=AHORA_RX)
+        reloj.start()
+        self.addCleanup(reloj.stop)

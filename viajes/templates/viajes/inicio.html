@@ -163,11 +163,11 @@
 
                     <p class="fuente-resultado">
                         <svg class="icono" aria-hidden="true"><use href="#i-info"/></svg>
-                        <span>Precios de {{ resultado.n_estaciones }} estaciones · Bencina en Línea (CNE){% if precios.consultado %}, consultado {{ precios.consultado|date:"d-m-Y H:i" }} UTC{% endif %}.</span>
+                        <span>Precios de {{ resultado.n_estaciones }} estaciones · {% if precios.generado %}RX Noticias (CC BY 4.0), con datos de Bencina en Línea (CNE), archivo generado el {{ precios.generado|date:"d-m-Y H:i" }} UTC{% else %}Bencina en Línea (CNE){% endif %}{% if precios.consultado %}, consultado {{ precios.consultado|date:"d-m-Y H:i" }} UTC{% endif %}.</span>
                     </p>
                     {% if precios.fuente == "respaldo" %}<p class="aviso-resultado"><strong>⚠ Datos guardados, no son precios actuales:</strong> la última descarga correcta fue el {{ precios.consultado|date:"d-m-Y H:i" }} UTC.</p>{% endif %}
                     {% if precios.aviso %}<p class="aviso-resultado">⚠ {{ precios.aviso }}</p>{% endif %}
-                    {% if precios.n_precios_descartados %}<p class="nota-resultado">{{ precios.n_precios_descartados }} precios de la fuente no se usaron (de hace más de {{ max_dias }} días o con valores inválidos).</p>{% endif %}
+                    {% if precios.n_precios_descartados %}<p class="nota-resultado">{{ precios.n_precios_descartados }} precios de la fuente no se usaron ({% if precios.generado %}valores inválidos o atípicos{% else %}de hace más de {{ max_dias }} días o con valores inválidos{% endif %}).</p>{% endif %}
                 {% else %}
                     <p class="vacio">Elige tu vehículo, indica cuánto manejas al mes y presiona "Recomendar combustible".</p>
                 {% endif %}
@@ -314,7 +314,7 @@
         <dl class="fuentes-lista">
             <div>
                 <dt>Precios y estaciones</dt>
-                <dd><strong>Bencina en Línea (CNE)</strong>, API pública <span class="url">api.bencinaenlinea.cl</span>. De ahí salen los precios, la fecha, el tipo de atención, la dirección y las coordenadas de cada estación. Se consulta cada hora; si falla, se muestran los últimos datos guardados (hasta 7 días) con un aviso.</dd>
+                <dd><strong>RX Noticias</strong> (2026), <em>Precios de combustible por comuna</em>, archivo <span class="url">rxnoticias.com/datos/combustible.json</span>, recopilación bajo licencia CC BY 4.0. Los datos de origen son de la <strong>Comisión Nacional de Energía (CNE)</strong>, publicados en Bencina en Línea, y la CNE los entrega bajo sus propias condiciones. De ahí salen los precios, la fecha de cada precio, el tipo de atención y la dirección de cada estación. Las coordenadas salen de la tabla del proyecto <strong>diland9/precios-combustibles-chile</strong> (datos públicos CNE/SEC), unida por comuna, marca y dirección. Se consulta cada hora; si falla o no hay datos nuevos, se muestran los últimos datos guardados, sin límite de antigüedad y con la fecha de cada precio.</dd>
             </div>
             <div>
                 <dt>Rendimiento de los autos de Chile (33 modelos)</dt>
