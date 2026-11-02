@@ -116,10 +116,17 @@ class ConRx(ConCache):
 
     def setUp(self):
         super().setUp()
-        for nombre, valor in (("FUENTE", "rx"), ("ARCHIVO_INICIAL", INICIAL), ("NOMINATIM_ACTIVO", False)):
+        # Por defecto sin los datos iniciales del proyecto (ni como último recurso ni como referencia de la primera descarga):
+        # las pruebas que los necesitan los activan con `con_inicial()`.
+        for nombre, valor in (("FUENTE", "rx"), ("ARCHIVO_INICIAL", self.carpeta / "sin-datos-iniciales.json"), ("NOMINATIM_ACTIVO", False)):
             p = mock.patch(f"viajes.bencina.{nombre}", valor)
             p.start()
             self.addCleanup(p.stop)
         reloj = mock.patch("viajes.bencina.ahora", return_value=AHORA_RX)
         reloj.start()
         self.addCleanup(reloj.stop)
+
+    @staticmethod
+    def con_inicial():
+        """Con los datos iniciales del proyecto (viajes/data/combustible_inicial.json): `with self.con_inicial(): ...`"""
+        return mock.patch("viajes.bencina.ARCHIVO_INICIAL", INICIAL)

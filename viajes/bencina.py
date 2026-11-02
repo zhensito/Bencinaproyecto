@@ -57,6 +57,8 @@ MAX_BYTES = int(os.environ.get("BENCINA_MAX_BYTES", str(25 * 1024 * 1024)))  # t
 VERSION_RESPALDO = 1
 MIN_ESTACIONES = 10  # una descarga con menos estaciones que esto no se considera válida
 FRACCION_MIN = 0.5   # ni la que pierde más de la mitad de las estaciones (o de las estaciones con precio) de la copia anterior
+FRACCION_MIN_RX = 0.8  # con RX Noticias se exige más: no se acepta una descarga que pierda más del 20 % de las estaciones, de las que tienen
+                       # precio o de los registros de precio de la referencia (el respaldo o, si no hay, los datos iniciales del proyecto)
 
 COMBUSTIBLES = ("93", "95", "97")
 RANGO_PRECIO = (500, 2500)  # $/L; fuera de este rango se descarta (ceros, 99999, etc.)
@@ -726,8 +728,14 @@ def _guardar_respaldo(doc):
         return False
 
 
-def _validar_descarga(estaciones, previo):
-    """Texto con el motivo si la descarga no sirve para reemplazar la copia anterior; "" si está bien."""
+def _n_registros(estaciones):
+    """Cantidad de registros de precio (todos los combustibles) de una lista de estaciones."""
+    return sum(len(e.get("combustibles") or e["precios"]) for e in estaciones)
+
+
+def _validar_descarga(estaciones, previo, fraccion=FRACCION_MIN):
+    """Texto con el motivo si la descarga no sirve para reemplazar la copia anterior; "" si está bien.
+    `previo` es la referencia con la que se compara (un documento con `estaciones`); `fraccion`, lo mínimo que debe conservar de ella."""
     con_precio = sum(1 for e in estaciones if e["precios"])
     if len(estaciones) < MIN_ESTACIONES:
         return f"solo {len(estaciones)} estaciones"
@@ -736,10 +744,12 @@ def _validar_descarga(estaciones, previo):
     if previo:
         antes = previo["estaciones"]
         antes_con_precio = sum(1 for e in antes if e["precios"])
-        if len(estaciones) < len(antes) * FRACCION_MIN:
+        if len(estaciones) < len(antes) * fraccion:
             return f"trae {len(estaciones)} estaciones y la copia anterior tenía {len(antes)}"
-        if con_precio < antes_con_precio * FRACCION_MIN:
+        if con_precio < antes_con_precio * fraccion:
             return f"trae {con_precio} estaciones con precio y la copia anterior tenía {antes_con_precio}"
+        if _n_registros(estaciones) < _n_registros(antes) * fraccion:
+            return f"trae {_n_registros(estaciones)} registros de precio y la copia anterior tenía {_n_registros(antes)}"
     return ""
 
 
@@ -768,20 +778,24 @@ def obtener_datos(forzar=False):
 
 
 def _actualizar_rx(previo):
-    """Descarga combustible.json y actualiza el respaldo solo si es válido y su `generado` es estrictamente posterior al de la
-    copia guardada. En cualquier otro caso (error, vacío, corrupto, incompleto, más antiguo) se sigue con la copia guardada."""
+    """Descarga combustible.json y actualiza el respaldo solo si es válido, su `generado` es estrictamente posterior y no trae
+    mucho menos datos que la referencia: el respaldo persistente o, mientras no exista, los datos iniciales del proyecto
+    (`combustible_inicial.json`). En cualquier otro caso (error, vacío, corrupto, incompleto, igual o más antiguo) se sigue con lo que hay."""
+    referencia, nombre = previo, "el guardado"
+    if not previo:
+        referencia, nombre = _referencia_inicial(), "el que viene con el proyecto"
     try:
         contenido = _get_json("combustible.json", url=FUENTE_URL)
         generado, _ = _leer_rx(contenido, ahora())
-        anterior = _fecha_utc((previo or {}).get("generado"))
+        anterior = _fecha_utc((referencia or {}).get("generado"))
         if anterior and generado == anterior:  # nada nuevo: no se toca el respaldo
-            datos = Datos(previo["estaciones"], "rx", timezone.now(), "", previo.get("descartados") or {}, generado=generado)
+            datos = Datos(referencia["estaciones"], "rx", timezone.now(), "", referencia.get("descartados") or {}, generado=generado)
             _escribir_cache(K_FRESCO, datos, CACHE_SEGUNDOS)
             return datos
         if anterior and generado < anterior:
-            return _fallo(f"RX Noticias publicó un archivo más antiguo ({generado:%d-%m-%Y %H:%M} UTC) que el guardado "
-                          f"({anterior:%d-%m-%Y %H:%M} UTC); se conserva el guardado.", ValueError("generado anterior"))
-        estaciones, descartados, generado = normalizar_rx(contenido, previo)
+            return _fallo(f"RX Noticias publicó un archivo más antiguo ({generado:%d-%m-%Y %H:%M} UTC) que {nombre} "
+                          f"({anterior:%d-%m-%Y %H:%M} UTC); se conserva {nombre}.", ValueError("generado anterior"))
+        estaciones, descartados, generado = normalizar_rx(contenido, referencia)
     except requests.Timeout as e:
         return _fallo(f"RX Noticias no respondió en {TIMEOUT:g} s.", e)
     except requests.exceptions.SSLError as e:
@@ -794,9 +808,9 @@ def _actualizar_rx(previo):
     except (requests.RequestException, ValueError) as e:  # vacío, corrupto, HTML en vez de JSON, estructura distinta
         return _fallo(f"RX Noticias devolvió un archivo que no se pudo interpretar ({str(e)[:200]}).", e)
 
-    motivo = _validar_descarga(estaciones, previo)
-    if motivo:  # incompleta: no reemplaza la copia buena
-        return _fallo(f"La descarga se rechazó porque parece incompleta ({motivo}); se conserva la copia anterior.", ValueError(motivo))
+    motivo = _validar_descarga(estaciones, referencia, FRACCION_MIN_RX)
+    if motivo:  # incompleta: no reemplaza lo que ya hay
+        return _fallo(f"La descarga se rechazó porque parece incompleta ({motivo}); se conserva {nombre}.", ValueError(motivo))
 
     ahora_utc = timezone.now()
     avisos = [] if VERIFICAR_TLS else ["Conexión sin verificar el certificado TLS (BENCINA_VERIFICAR_TLS=0)."]
@@ -898,6 +912,14 @@ def _respaldo_o_error(mensaje):
         inicial.aviso = f"{mensaje} No había copia guardada: se muestran los datos que vienen con el proyecto."
         return inicial
     return Datos(aviso=f"{mensaje} No hay precios guardados para mostrar.")
+
+
+def _referencia_inicial():
+    """Los datos iniciales del proyecto como referencia (generado, estaciones y descartados) cuando todavía no hay respaldo; None si no hay."""
+    inicial = _datos_iniciales()
+    if not inicial:
+        return None
+    return {"generado": inicial.generado.isoformat(), "estaciones": inicial.estaciones, "descartados": inicial.descartados}
 
 
 def _datos_iniciales():

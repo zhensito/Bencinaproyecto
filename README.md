@@ -4,13 +4,13 @@
 
 ## Funcionalidades
 
-- **Recomendador de combustible.** Se elige el vehículo, los km al mes y, opcionalmente, una comuna. La app calcula para cada combustible (93, 95 y 97) el **costo por km = precio por litro ÷ rendimiento del auto** y el **gasto mensual = costo por km × km al mes**, usando la estación más barata de cada combustible (en la comuna indicada o en todo Chile). Recomienda el más barato **que cumpla el octanaje que pide el fabricante**; muestra el costo por km, el gasto mensual, la estación más barata con la fecha de su precio, todas las opciones ordenadas por costo/km y una explicación de por qué se recomienda ese combustible.
+- **Recomendador de combustible.** Se elige el vehículo, los km al mes y, opcionalmente, una comuna. Para cada combustible (93, 95 y 97) la app toma la estación con el **precio más bajo** (en la comuna indicada o en todo Chile) y calcula el **costo por km = precio por litro ÷ rendimiento del auto** y el **gasto mensual = costo por km × km al mes**. Luego recomienda la alternativa **más económica por km que cumpla el octanaje mínimo que recomienda el fabricante**, cuando ese dato está verificado (hoy solo para el Kia Soluto 1.4, que pide 93). Si ninguna alternativa lo cumple, muestra la más barata y lo advierte. **Si el octanaje no está verificado** (los otros 32 modelos de Chile y todos los referenciales), recomienda el más barato por km y **lo dice explícitamente** en la justificación, pidiendo confirmarlo en el manual. Muestra el costo por km, el gasto mensual, la estación más barata **con la fecha de su precio**, todas las opciones ordenadas por costo/km y la explicación. Ese precio más bajo puede ser antiguo (los precios viejos no se descartan): por eso se muestra su fecha.
 - **Selección del vehículo.** Dos modos: «Marca y modelo» (se escribe o se elige de una lista que sugiere opciones) y «Escribir» (búsqueda libre del nombre completo; si hay varios parecidos, el mensaje los lista). Sin JavaScript queda el campo de texto.
 - **Catálogo de autos.** 33 modelos «de Chile» y cerca de 2.000 modelos referenciales de otros mercados (ver «Catálogo ampliado»). Cada resultado indica la fuente del rendimiento.
-- **Calculadora de repostaje.** Litros × precio por litro = costo total (litros mayores que 0 y hasta 500; precio mayor que 0 y hasta 10.000). No depende de la API.
-- **Mapa de estaciones** (Leaflet, mapa base de Esri). Muestra cada estación con coordenadas válidas, coloreada según el precio del combustible elegido (93, 95 o 97): verde, amarillo y rojo dividen las estaciones con precio en tres tramos de igual cantidad, y gris es «sin precio informado». La leyenda indica los rangos en pesos. Al tocar una estación se abre un globo con su dirección y los precios 93/95/97 con fecha y tipo de atención.
+- **Calculadora de repostaje.** Litros × precio por litro = costo total (litros mayores que 0 y hasta 500; precio mayor que 0 y hasta 10.000). No depende de la fuente de precios.
+- **Mapa de estaciones** (Leaflet, mapa base de Esri). Muestra cada estación con coordenadas, coloreada según el precio del combustible elegido (93, 95 o 97): verde, amarillo y rojo dividen las estaciones con precio en tres tramos de igual cantidad, y gris es «sin precio informado». La leyenda indica los rangos en pesos. Al tocar una estación se abre un globo con su dirección y los precios 93/95/97 **con su fecha** y tipo de atención. Los precios antiguos se dibujan igual que los demás: no se descartan, y se ve su fecha en el globo y en la lista. Las estaciones sin coordenadas no se dibujan (el texto del mapa dice cuántas) pero sí salen en la lista.
 - **Filtros del mapa.** Región, comuna (con sugerencias), búsqueda por marca o dirección, botones 93/95/97, «Limpiar» y «Centrar mapa». La lista «Las más baratas» (hasta 15 estaciones) acompaña al mapa y al elegir una estación el mapa se centra en ella y abre su globo.
-- **Ventana «Fuentes»** (menú superior): lista de dónde sale cada dato. Los mensajes de la página indican además la fecha de consulta, si se usan datos guardados o un archivo local y cuántos precios se descartaron.
+- **Ventana «Fuentes»** (menú superior): lista de dónde sale cada dato. Los mensajes de la página y el texto bajo el mapa indican la fuente (RX Noticias), la fecha de consulta, si se usan datos guardados o un archivo local, cuántos precios no se usaron (valores inválidos o atípicos) y cuántos tienen más de 30 días (se muestran con su fecha).
 
 ### Diseño de la interfaz
 
@@ -24,7 +24,7 @@
 
 | Parte | Tecnología |
 |---|---|
-| Servidor | Python y Django (plantillas y vistas; sin base de datos); `requests` para consultar la API |
+| Servidor | Python y Django (plantillas y vistas; sin base de datos); `requests` para descargar `combustible.json` |
 | Datos de precios | `combustible.json` de RX Noticias (datos de la CNE), sin token |
 | Interfaz | HTML, CSS propio (`estilos.css`, con variables de diseño) y JavaScript sin frameworks |
 | Mapa | Leaflet 1.9.4 (desde `unpkg.com`) y mapa base Esri World Street Map (`server.arcgisonline.com`) |
@@ -36,14 +36,17 @@
 
 | Archivo | Qué hace |
 |---|---|
-| `viajes/bencina.py` | Consulta, normaliza y guarda en caché los datos de la API; filtra estaciones |
+| `viajes/bencina.py` | Descarga y normaliza `combustible.json` de RX Noticias, asigna coordenadas, guarda el respaldo y filtra estaciones (incluye la ruta heredada de la API de Bencina en Línea, solo con `BENCINA_FUENTE=api`) |
 | `viajes/views.py` | Catálogo de autos, búsqueda de vehículos, cálculo de la recomendación, calculadora de repostaje y el endpoint `/estaciones.json` del mapa |
 | `viajes/templates/viajes/inicio.html` | Página completa (se sirve en `/`); `_iconos.html` guarda los iconos |
 | `viajes/static/viajes/estilos.css` | Todos los estilos y animaciones |
 | `viajes/static/viajes/formulario.js` | Selector de marca/modelo, envío de cada formulario sin recargar, ventana de fuentes y carrusel de fotos del encabezado |
 | `viajes/static/viajes/mapa.js` | Mapa, marcadores, leyenda, filtros y lista de estaciones |
 | `viajes/data/catalogo_referencial.csv` | Modelos referenciales de otros mercados |
-| `viajes/tests/` | Pruebas automáticas y la muestra real de la API |
+| `viajes/data/combustible_inicial.json` | Copia del `combustible.json` recibido el 1-nov-2026: último recurso si no hay respaldo ni descarga, y referencia para validar la primera descarga |
+| `viajes/data/coordenadas_semilla.json` | Tabla inicial de coordenadas por estación (snapshot del 30-10-2026 de diland9) |
+| `.cache_bencina/` | Se crea al ejecutar (no está en Git): respaldo, coordenadas guardadas y caché de Django |
+| `viajes/tests/` | Pruebas automáticas y las muestras que usan (`muestra_api.json` de la API heredada) |
 
 Cada formulario se envía con JavaScript y solo reemplaza su propio resultado, de modo que calcular un repostaje no borra la recomendación. Si JavaScript falla, el envío normal recarga la página y sigue funcionando.
 
@@ -51,9 +54,9 @@ Cada formulario se envía con JavaScript y solo reemplaza su propio resultado, d
 
 - Python 3.11 o superior (probado con 3.13).
 - Dependencias: `Django` y `requests` (ver `requirements.txt`).
-- Conexión a internet para obtener los precios y cargar el mapa (Leaflet viene de `unpkg.com` y los mosaicos de `server.arcgisonline.com`). Las tipografías e iconos van incluidos en el proyecto.
+- Conexión a internet para descargar los precios (sin ella la página usa el último respaldo o los datos incluidos en el proyecto) y para cargar el mapa (Leaflet viene de `unpkg.com` y los mosaicos de `server.arcgisonline.com`). Las tipografías e iconos van incluidos en el proyecto.
 
-No hay base de datos que configurar ni credenciales: la API de precios es pública y no usa token.
+No hay base de datos que configurar ni credenciales: el archivo de precios es público y no usa token.
 
 ## Ejecutar en local
 
@@ -64,7 +67,7 @@ python -m pip install -r requirements.txt
 python manage.py runserver
 ```
 
-Abrir <http://127.0.0.1:8000/>. (Django avisará de migraciones sin aplicar: se puede ignorar, la app no usa base de datos.)
+Abrir <http://127.0.0.1:8000/>. (Django avisará de migraciones sin aplicar: se puede ignorar, la app no usa base de datos.) La primera consulta descarga el archivo de precios y crea la carpeta `.cache_bencina/`; si esa descarga falla, la página muestra los datos incluidos en el proyecto con un aviso. Para comprobar el proyecto: `python manage.py check` y `python manage.py test`.
 
 Opcional: crear antes un entorno virtual con `python -m venv venv` y activarlo con `venv\Scripts\activate`.
 
@@ -81,18 +84,18 @@ Los precios cambian cada día, por eso los resultados no traen cifras fijas.
 
 ## Sin internet o para una demostración estable
 
-`BENCINA_JSON_LOCAL` hace que la app lea un archivo en vez de la API. Se incluye una muestra real (35 estaciones, 22 al 26 de octubre de 2026):
+`BENCINA_JSON_LOCAL` hace que la app lea un archivo en vez de descargarlo. Sirve un `combustible.json` (el proyecto incluye uno, del 1-nov-2026, generado a las 08:30 UTC, con la fecha propia de cada precio):
 
 ```powershell
-$env:BENCINA_JSON_LOCAL = "viajes\tests\fixtures\muestra_api.json"
+$env:BENCINA_JSON_LOCAL = "viajes\data\combustible_inicial.json"
 python manage.py runserver
 ```
 
-La página avisa «archivo local» para no pasar esos datos por actuales.
+La página avisa «archivo local» para no pasar esos datos por actuales. (El formato de la API heredada, como `viajes\tests\fixtures\muestra_api.json`, también se acepta.)
 
 Para desplegar fuera de tu equipo, la configuración se puede cambiar con variables de entorno (sin ellas todo sigue como en desarrollo): `DJANGO_SECRET_KEY`, `DJANGO_DEBUG=0` y `DJANGO_ALLOWED_HOSTS` (lista separada por comas).
 
-La estación que viene repetida en la respuesta de la API (mismo `id`) se cuenta una sola vez. Sin conexión a internet el mapa no carga (Leaflet y los mosaicos son externos), pero el recomendador sí.
+Sin conexión a internet el mapa no carga (Leaflet y los mosaicos son externos), pero el recomendador sí.
 
 ## Fuente de datos: RX Noticias
 
@@ -102,9 +105,9 @@ Los precios y estaciones salen de `https://rxnoticias.com/datos/combustible.json
 
 **Qué trae y qué no.** Por estación: marca, dirección, comuna, región, código de comuna y, por combustible (93, 95, 97, diésel y kerosene), precio, fecha del precio, `vigente` y `autoservicio`. **No trae identificador de estación ni coordenadas, ni GLP ni GNC.** El archivo tiene además `generado` (cuándo lo generó RX Noticias), que **no es la fecha de los precios**: cada precio tiene la suya. `vigente` solo significa «el precio tiene hasta 30 días»; no se usa para descartar nada.
 
-**Cómo se actualiza.** Cada hora (caché de 1 h) se descarga el archivo (con tiempo de espera, límite de tamaño y verificación TLS) y solo reemplaza al respaldo si es válido **y su `generado` es estrictamente posterior** al del respaldo guardado. Si el `generado` es igual, se conserva el respaldo (la fuente respondió, simplemente no hay novedades); si es anterior, se rechaza; una fecha de generación en el futuro (más de un día) también, para que no bloquee las actualizaciones siguientes. Además del `generado`, rigen las validaciones de siempre (mínimo de 10 estaciones, al menos la mitad con precios, sin perder más de la mitad respecto de la copia anterior).
+**Cómo se actualiza.** Cada hora (caché de 1 h) se descarga el archivo (con tiempo de espera, límite de tamaño y verificación TLS). Se compara con una **referencia**: el respaldo guardado o, mientras todavía no exista, `viajes/data/combustible_inicial.json`. Reemplaza al respaldo solo si es válido, su `generado` es **estrictamente posterior** al de la referencia y no trae **muchos menos datos**: debe conservar al menos el 80 % de las estaciones, de las estaciones con precio y de los registros de precio de la referencia (`FRACCION_MIN_RX`), además del mínimo de 10 estaciones y de que al menos la mitad tenga precios. Si el `generado` es igual, no se toca nada (la fuente respondió, simplemente no hay novedades); si es anterior, se rechaza; una fecha de generación en el futuro (más de un día) también, para que no bloquee las actualizaciones siguientes. Si la fuente publica de verdad un archivo bastante más chico, se seguirá rechazando y la página mostrará un aviso con el motivo; hay que revisarlo a mano.
 
-**Si la fuente falla** (sin conexión, timeout, error HTTP, certificado, archivo vacío, corrupto, truncado, HTML en vez de JSON o demasiado grande), la página sigue con el **último respaldo válido**, sin límite de antigüedad y con la fecha de cada precio a la vista. Si no hay respaldo, usa `viajes/data/combustible_inicial.json` (copia del archivo recibido el 1-nov-2026, generado 08:30 UTC), marcado como datos guardados y **no como descarga**. Solo si tampoco existe, la página dice que no hay precios. Los precios viejos **no se eliminan** ni se eliminan estaciones por ello.
+**Si la fuente falla** (sin conexión, timeout, error HTTP, certificado, archivo vacío, corrupto, truncado, HTML en vez de JSON o demasiado grande) o la descarga se rechaza (igual, antigua o incompleta), la página sigue con el **último respaldo válido**, sin límite de antigüedad y con la fecha de cada precio a la vista. Si no hay respaldo, usa `viajes/data/combustible_inicial.json`, marcado como datos guardados y **no como descarga**; su fecha de generación es la del 1-nov-2026, así que sus precios pueden ser antiguos. Solo si tampoco existe, la página dice que no hay precios y no inventa datos. Los precios viejos **no se eliminan** ni se eliminan estaciones por ello.
 
 **Identificador de estación.** El archivo no tiene uno, así que el `id` interno es `rx` + 12 caracteres de un hash de la clave `código de comuna | marca | dirección`, con la marca y la dirección normalizadas (mayúsculas, sin tildes ni puntuación). **Límite:** si una estación cambia de marca o de dirección, la clave y el `id` cambian y se tratará como otra estación (pierde su coordenada hasta que se vuelva a encontrar). Si dos estaciones comparten clave, se les asigna un `id` distinto y ninguna recibe coordenadas.
 
@@ -116,15 +119,14 @@ Los precios y estaciones salen de `https://rxnoticias.com/datos/combustible.json
 
 - `viajes/bencina.py` descarga y normaliza la fuente; `viajes/views.py` solo usa el resultado.
 - **Caché de 1 hora** (en archivo, en `.cache_bencina/cache_django/`, separada del respaldo: limpiar la caché de Django no toca los respaldos). Si una consulta falla no se reintenta durante 60 s.
-- **Respaldo permanente** (`.cache_bencina/respaldo.json`, más `respaldo.previo.json` con la copia anterior). Cada descarga válida y más reciente lo reescribe de forma atómica (archivo temporal y cambio de nombre, así nunca queda a medias) y **no caduca**: sobrevive a reinicios de Django y del equipo. Guarda la hora de la descarga, si fue completa o parcial y el estado de cada endpoint, las **respuestas originales** de la API (estaciones y marcas) y los **datos normalizados** que usa la aplicación. Además de 93, 95 y 97, conserva todos los combustibles que entrega la API (DI, KE, GNC, A93, A95, A97, ADI…) con su nombre largo, unidad de cobro, fecha y tipo de atención, y cualquier otro campo que venga en cada estación. El recomendador sigue usando solo 93, 95 y 97.
-- **Límite de tamaño.** Cada respuesta de la API se lee por trozos y se cuentan los bytes realmente recibidos (ya descomprimidos); si pasan de `BENCINA_MAX_BYTES` (25 MB por defecto) se rechaza sin interpretarla como JSON y el respaldo no cambia. Se mantienen el tiempo de espera y la verificación TLS.
+- **Respaldo permanente** (`.cache_bencina/respaldo.json`, más `respaldo.previo.json` con la copia anterior). Cada descarga válida y más reciente lo reescribe de forma atómica (archivo temporal y cambio de nombre, así nunca queda a medias) y **no caduca**: sobrevive a reinicios de Django y del equipo. Guarda la hora de la descarga, la fecha de generación del archivo (`generado`), el estado de la descarga, el **archivo original** de RX Noticias (`crudo`) y los **datos normalizados** que usa la aplicación. Además de 93, 95 y 97, conserva diésel y kerosene con su nombre, unidad, fecha y tipo de atención; y, si una copia anterior tenía combustibles que RX Noticias no entrega (GLP, GNC), los mantiene con su fecha original. El recomendador usa solo 93, 95 y 97.
+- **Límite de tamaño.** La respuesta se lee por trozos y se cuentan los bytes realmente recibidos (ya descomprimidos); si pasan de `BENCINA_MAX_BYTES` (25 MB por defecto) se rechaza sin interpretarla como JSON y el respaldo no cambia. Se mantienen el tiempo de espera y la verificación TLS.
 - **Escrituras: qué se garantiza y qué no.** Cada archivo (`respaldo.json` y `respaldo.previo.json`) se escribe en un temporal de nombre único y se publica entero con `os.replace`, así que **nunca queda a medias**; si algo falla, la copia anterior se conserva. Pero la rotación (copiar la copia vigente a `respaldo.previo.json`) y la publicación del archivo nuevo son **dos pasos**, no una única operación atómica, y no hay bloqueo entre procesos (no se justifica para una descarga por hora). Si dos procesos guardan exactamente a la vez, ambos archivos siguen siendo válidos, pero puede quedar como vigente la descarga que terminó de publicar al final aunque no sea la más reciente, y la copia previa puede ser una de las dos versiones anteriores. Si el proceso se cae entre ambos pasos, `respaldo.previo.json` y `respaldo.json` pueden quedar iguales.
 - **Temporales.** Solo se crean (y se limpian) archivos con los nombres `.tmp-resp-*.json` y `.tmp-previo-*.json`. Al guardar se borran los que lleven más de una hora sin modificarse (restos de una caída); los recientes, que podrían ser de una escritura en curso, y cualquier otro archivo de la carpeta no se tocan.
 - **Credenciales en registros y mensajes.** Todo texto que muestra o registra el módulo pasa por un saneado que oculta `usuario:clave@` dentro de una URL (también si la clave contiene `@`) y parámetros como `token=`, `key=` o `password=`; se aplica a las URL, a los mensajes de las excepciones y al comienzo de las respuestas que se registran.
 - **Tiempo de espera.** `BENCINA_TIMEOUT` (15 s) es el tiempo de espera de `requests` **para conectar y para cada lectura**; no es un límite de duración total de la descarga. Una respuesta que llegue con cuentagotas, sin pasar nunca de 15 s entre trozos y sin superar `BENCINA_MAX_BYTES`, podría tardar mucho más. No se agregó un límite total para no complicar el código; mientras tanto, la descarga ocurre una vez por hora y, tras un fallo, no se reintenta durante 60 s.
-- **Protección del respaldo.** Una descarga no reemplaza la copia buena si trae menos de 10 estaciones, si menos de la mitad tiene precios o si pierde más de la mitad de las estaciones (o de las estaciones con precio) de la copia anterior; en ese caso se conserva la copia y el aviso dice por qué. Si falla solo el endpoint de marcas, se reutilizan las de la descarga anterior y la descarga queda marcada como parcial. Un JSON corrupto o ilegible se ignora (se prueba con la copia anterior) sin borrarlo y sin provocar un error 500.
-- **Cuando la fuente no responde** se muestran los datos guardados con la etiqueta «Datos guardados, no son precios actuales» y la fecha de su última descarga, por antiguos que sean (no se vuelven a filtrar por antigüedad). Sin ninguna copia, la página lo dice y no inventa datos.
-- Se descartan precios fuera de $500–$2.500/L y los marcados `atipico`, pero **no** los antiguos con RX Noticias (la ruta heredada de la API sí descarta los de más de `BENCINA_MAX_DIAS`); las coordenadas con coma decimal se interpretan y las que caen fuera de Chile se ignoran (esa estación queda en la lista, sin marcador). «A93» (asistido) y «93» (autoservicio) se juntan en un solo combustible, con el precio más bajo.
+- **Protección del respaldo.** Con RX Noticias, una descarga no reemplaza lo que ya hay si trae menos de 10 estaciones, si menos de la mitad tiene precios, o si conserva menos del 80 % de las estaciones, de las estaciones con precio o de los registros de precio de la referencia (ver «Cómo se actualiza»); en ese caso se conserva la copia y el aviso dice por qué. La ruta heredada de la API usa el umbral anterior (50 %). Un JSON corrupto o ilegible se ignora (se prueba con la copia anterior) sin borrarlo y sin provocar un error 500.
+- Se descartan precios fuera de $500–$2.500/L y los marcados `atipico`, pero **no** los antiguos con RX Noticias (la ruta heredada de la API sí descarta los de más de `BENCINA_MAX_DIAS`). «A93» (asistido) y «93» (autoservicio) de la ruta heredada se juntan en un solo combustible, con el precio más bajo; RX Noticias entrega un precio por combustible. Las coordenadas con coma decimal se interpretan y las que caen fuera de Chile se ignoran (esa estación queda en la lista, sin marcador).
 - Con RX Noticias cada estación se identifica por un `id` interno derivado de su clave (ver arriba); con la ruta heredada, por el `id` de la API.
 
 Variables de entorno opcionales:
@@ -140,7 +142,7 @@ Variables de entorno opcionales:
 | `BENCINA_VERIFICAR_TLS` | `1` | La verificación TLS está siempre activa por defecto y nunca se desactiva sola. `0` existe solo como **diagnóstico puntual** (la página avisa que la conexión no está verificada) y **no se permite en producción** |
 | `BENCINA_CACHE_SEGUNDOS` | `3600` | Duración de la caché fresca (el respaldo permanente no caduca) |
 | `BENCINA_CACHE_DIR` | `.cache_bencina` | Carpeta del respaldo permanente (la caché de Django va en su subcarpeta `cache_django`) |
-| `BENCINA_MAX_BYTES` | `26214400` | Tamaño máximo (bytes) de una respuesta de la API |
+| `BENCINA_MAX_BYTES` | `26214400` | Tamaño máximo (bytes) de una respuesta de la fuente |
 | `BENCINA_MAX_DIAS` | `30` | Antigüedad máxima de un precio (solo con `BENCINA_FUENTE=api`) |
 | `BENCINA_JSON_LOCAL` | vacío | Leer un archivo local (formato de `combustible.json` o de la API) en vez de descargar |
 
@@ -148,15 +150,15 @@ Variables de entorno opcionales:
 
 El código y la documentación se desarrollaron con ayuda de Claude (Anthropic) y, para reunir datos de rendimiento de autos, con una segunda IA de búsqueda. Lo declaramos aquí para que se pueda revisar con transparencia. Todas las funcionalidades y decisiones de diseño fueron dirigidas por el equipo; la IA las implementó. El equipo revisó y probó cada etapa antes de aceptarla.
 
-**Por qué el historial de GitHub muestra a Claude como autor de casi todos los commits.** El proyecto se trabajó primero como borrador en Visual Studio (app Django, vista inicial y plantilla `inicio.html` con el diseño del equipo) y no estaba publicado en GitHub. Los commits se hicieron al subirlo y mejorarlo por etapas con Claude (precios reales, mapa, filtros, pruebas), y por eso figuran a su nombre. Que aparezcan en pocos commits no refleja el trabajo previo ni las decisiones del equipo.
+**Por qué el historial de GitHub muestra a Claude como autor de casi todos los commits.** El proyecto se trabajó primero como borrador en Visual Studio (app Django, vista inicial y plantilla `inicio.html` con el diseño del equipo) y no estaba publicado en GitHub. Los commits se hicieron al subirlo y mejorarlo por etapas con Claude (precios reales, mapa, filtros, pruebas, cambio de fuente de datos), y por eso figuran a su nombre. Que aparezcan en pocos commits no refleja el trabajo previo ni las decisiones del equipo.
 
 | Qué hizo la IA | Qué definió, pidió y verificó el equipo |
 |---|---|
-| Escribió y modificó el código de Django, el normalizador de la API (`viajes/bencina.py`), el mapa (`mapa.js`) y las pruebas automáticas, y revisó el código existente para eliminar contradicciones y errores pequeños antes de publicarlo. | Definió qué debe hacer la aplicación y pidió los cambios: quitar altitud, latitud y tipo de camino porque no cambiaban qué combustible conviene, y justificar según el octanaje que recomienda el fabricante para cuidar el motor. |
-| Propuso integrar Bencina en Línea y evaluó otras fuentes (ver «Fuentes evaluadas»). | Pidió usar datos reales en vez de cargarlos a mano, el buscador de vehículos, la calculadora de repostaje, el mapa y los filtros. |
+| Escribió y modificó el código de Django, el normalizador de datos (`viajes/bencina.py`), el mapa (`mapa.js`) y las pruebas automáticas, y revisó el código existente para eliminar contradicciones y errores pequeños antes de publicarlo. | Definió qué debe hacer la aplicación y pidió los cambios: quitar altitud, latitud y tipo de camino porque no cambiaban qué combustible conviene, y justificar según el octanaje que recomienda el fabricante para cuidar el motor. |
+| Investigó fuentes de precios alternativas cuando la API de Bencina en Línea falló por su certificado vencido, e implementó RX Noticias, el respaldo y la recuperación de coordenadas (ver «Fuentes evaluadas»). | Pidió datos reales en vez de cargarlos a mano, el buscador de vehículos, la calculadora de repostaje, el mapa y los filtros; eligió RX Noticias y la tabla de coordenadas de diland9, y definió que la página nunca quede sin datos aunque la fuente falle. |
 | | Probó la aplicación en su computador y reportó los errores, por ejemplo el bloqueo de los mosaicos del mapa, que se corrigió cambiando de proveedor. |
 
-Cómo se verificó el trabajo de la IA: 67 pruebas automáticas (`python manage.py test`), una prueba en navegador con una muestra real de 1.810 estaciones, la ejecución local con datos en vivo y la revisión de que el costo por km (precio ÷ rendimiento) coincide con el cálculo a mano. Hay límites que seguimos sin resolver y están en «Limitaciones conocidas»: el octanaje del fabricante solo está cargado para un modelo y no todos los rendimientos del catálogo están verificados.
+Cómo se verificó el trabajo de la IA: pruebas automáticas (`python manage.py test`, ver «Pruebas»), pruebas de extremo a extremo con un servidor local que simula la fuente (caída, archivo truncado, vacío, HTML, más antiguo y más nuevo), una prueba en navegador (Chromium) con una muestra real de 1.810 estaciones de la API heredada, y la revisión de que el costo por km (precio ÷ rendimiento) coincide con el cálculo a mano. **La descarga real desde `rxnoticias.com` no se ha comprobado** (ver «Limitaciones conocidas»). Hay límites que seguimos sin resolver: el octanaje del fabricante solo está cargado para un modelo y no todos los rendimientos del catálogo están verificados.
 
 ## Pruebas
 
@@ -164,7 +166,7 @@ Cómo se verificó el trabajo de la IA: 67 pruebas automáticas (`python manage.
 python manage.py test
 ```
 
-175 pruebas (fuente RX Noticias —lectura, claves, coordenadas, respaldo, vistas y Nominatim—, normalización, selector de marca y modelo, catálogo referencial, caché, errores de red, recomendador, calculadora, filtros y endpoint del mapa). Usan una muestra real guardada en `viajes/tests/fixtures/`, no consultan internet.
+186 pruebas (fuente RX Noticias —lectura, claves, coordenadas, respaldo, referencia inicial, vistas y Nominatim—, ruta heredada de la API, normalización, selector de marca y modelo, catálogo referencial, caché, errores de red, recomendador, calculadora, filtros y endpoint del mapa). Usan archivos guardados en el proyecto (`viajes/tests/fixtures/muestra_api.json`, `viajes/data/combustible_inicial.json`) y respuestas simuladas; **no consultan internet** (la descarga real de RX Noticias no está probada).
 
 ## Catálogo ampliado (datos referenciales)
 
@@ -198,7 +200,7 @@ Cómo se usan:
 
 - **La descarga real desde `rxnoticias.com` no se pudo comprobar** desde el entorno donde se desarrolló (el proxy la bloquea). Se probó con el archivo real recibido el 1-nov-2026 y con respuestas simuladas; la primera ejecución con internet en tu computador o en el servidor es la verificación real. No sabemos cada cuánto actualiza RX Noticias (la página no lo declara) ni de dónde obtiene los datos. Si falla, la página lo indica y usa los últimos datos guardados.
 - **Las coordenadas son una tabla fija** (snapshot del 30-10-2026): las estaciones nuevas, o las que cambien de marca o dirección, quedan sin coordenadas (salen en los listados, no en el mapa) hasta que se agreguen a `coordenadas.json` o se active Nominatim, que no se probó contra OpenStreetMap. Nominatim no resuelve bien direcciones de carretera («Km», «Ruta»), que son el 17 % de las direcciones del archivo.
-- **El texto bajo el mapa** («Fuente: Bencina en Línea (CNE)…») está escrito en `mapa.js`, que no se modificó en esta etapa; el resto de la página sí cita a RX Noticias.
+- **El precio más barato puede ser antiguo.** El recomendador y la lista «Las más baratas» usan el precio más bajo informado, aunque tenga semanas o meses: no se filtran por antigüedad. La fecha se muestra siempre, pero no hay una advertencia en el resultado cuando el precio elegido es antiguo.
 - RX Noticias no entrega GLP ni GNC: si había datos de esos combustibles en un respaldo anterior, se conservan con su fecha original, pero no se actualizan.
 - **Catálogo de autos:** son 33 modelos «de Chile» (rendimiento de Consumo Vehicular, de los fabricantes o de Autocosmos; la fuente se muestra en cada resultado; no todos están verificados) más ~2.000 modelos **referenciales** de otros mercados (ver «Catálogo ampliado»). El **octanaje del fabricante solo está cargado para el Kia Soluto**; para el resto se recomienda el más barato y se avisa.
 - El mapa base es de Esri (World Street Map, con atribución, sin API key). Se descartaron `tile.openstreetmap.org` (bloqueó los mosaicos con 403 en pruebas locales) y CARTO (exige API key). Para un sitio con mucho tráfico habría que revisar las condiciones de uso del proveedor.

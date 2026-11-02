@@ -1104,14 +1104,16 @@ class RxDescargaTests(ConRx):
         self.assertEqual(bencina._ruta_respaldo().read_text(encoding="utf-8"), "{ roto")  # y no se borró
 
     def test_sin_respaldo_y_sin_descarga_se_usan_los_datos_que_vienen_con_el_proyecto(self):
-        d = self.caida(requests.ConnectionError("sin red"))
+        with self.con_inicial():
+            d = self.caida(requests.ConnectionError("sin red"))
         self.assertEqual((d.fuente, len(d.estaciones), d.generado), ("respaldo", 1768, datetime(2026, 11, 1, 8, 30, 52)))
         self.assertIn("vienen con el proyecto", d.aviso)
         self.assertFalse(bencina._ruta_respaldo().exists())  # no se hace pasar por una descarga
         self.assertEqual(min(c["fecha"] for e in d.estaciones for c in e["combustibles"]), "2025-08-28")  # cada precio con su fecha real
 
     def test_primera_descarga_defectuosa_tambien_cae_en_los_datos_iniciales(self):
-        d = self.bajar(RespuestaFalsa(cuerpo=b"<html>no</html>"))
+        with self.con_inicial():
+            d = self.bajar(RespuestaFalsa(cuerpo=b"<html>no</html>"))
         self.assertEqual((d.fuente, len(d.estaciones)), ("respaldo", 1768))
         self.assertFalse(bencina._ruta_respaldo().exists())
 
@@ -1197,6 +1199,145 @@ class RxDescargaTests(ConRx):
             self.assertNotIn(secreto, texto)
 
 
+def sin_estaciones(contenido, cuantas):
+    """Quita las últimas `cuantas` estaciones del archivo (las comunas se conservan)."""
+    quitar = {id(e) for _, e in estaciones_crudas(contenido)[-cuantas:]}
+    for c in contenido["comunas"]:
+        c["estaciones"] = [e for e in c["estaciones"] if id(e) not in quitar]
+    return contenido
+
+
+class RxReferenciaInicialTests(ConRx):
+    """Mientras no hay respaldo persistente, la referencia son los datos iniciales del proyecto (combustible_inicial.json, 1.768
+    estaciones, 7.802 registros de precio, generado el 2026-11-01 08:30 UTC): una descarga igual, anterior, incompleta o defectuosa no
+    los reemplaza. Con respaldo persistente, la referencia es ese respaldo."""
+    MAS_NUEVO = "2026-11-02T08:30:52+00:00"
+
+    def setUp(self):
+        super().setUp()
+        p = self.con_inicial()
+        p.start()
+        self.addCleanup(p.stop)
+
+    def bajar(self, contenido=None, ahora=datetime(2026, 11, 2, 12), **kw):
+        with mock.patch("viajes.bencina.requests.get", side_effect=rx_falsa(contenido, **kw)), \
+                mock.patch("viajes.bencina.ahora", return_value=ahora):
+            return bencina.obtener_datos(forzar=True)
+
+    def sin_respaldo(self):
+        self.assertFalse(bencina._ruta_respaldo().exists())  # la fuente inicial sigue siendo la única copia: no se escribió nada
+
+    def test_la_referencia_inicial_es_la_esperada(self):
+        ref = bencina._referencia_inicial()
+        self.assertEqual((len(ref["estaciones"]), bencina._n_registros(ref["estaciones"])), (1768, 7802))
+        self.assertEqual(bencina._fecha_utc(ref["generado"]), datetime(2026, 11, 1, 8, 30, 52))
+
+    def test_descarga_con_el_mismo_generado_que_los_datos_iniciales_se_rechaza(self):
+        d = self.bajar(sumar_a_precios(cargar_rx()))  # mismo `generado`, precios distintos
+        self.assertEqual((d.fuente, len(d.estaciones)), ("rx", 1768))
+        self.assertEqual(por_clave(d.estaciones)[bencina.clave_estacion(*AMBAR)]["precios"]["93"]["precio"], 1661.0)  # los de siempre
+        self.sin_respaldo()
+
+    def test_descarga_mas_antigua_que_los_datos_iniciales_se_rechaza(self):
+        d = self.bajar(sumar_a_precios(con_generado(cargar_rx(), "2026-10-30T08:30:52+00:00")))
+        self.assertEqual((d.fuente, len(d.estaciones), d.generado), ("respaldo", 1768, datetime(2026, 11, 1, 8, 30, 52)))
+        self.assertIn("más antiguo", d.aviso)
+        self.assertIn("que viene con el proyecto", d.aviso)
+        self.assertEqual(por_clave(d.estaciones)[bencina.clave_estacion(*AMBAR)]["precios"]["93"]["precio"], 1661.0)
+        self.sin_respaldo()
+
+    def test_descarga_completa_y_mas_nueva_se_acepta_y_crea_el_respaldo(self):
+        d = self.bajar(sumar_a_precios(con_generado(cargar_rx(), self.MAS_NUEVO)))
+        self.assertEqual((d.fuente, len(d.estaciones), d.generado), ("rx", 1768, datetime(2026, 11, 2, 8, 30, 52)))
+        self.assertEqual(por_clave(d.estaciones)[bencina.clave_estacion(*AMBAR)]["precios"]["93"]["precio"], 1761.0)
+        self.assertEqual(json.loads(bencina._ruta_respaldo().read_text(encoding="utf-8"))["generado"], "2026-11-02T08:30:52")
+
+    def test_descarga_nueva_pero_incompleta_no_reemplaza_los_datos_iniciales(self):
+        casos = {
+            "5 comunas": lambda c: c.update(comunas=c["comunas"][:5]),
+            "mitad de las estaciones": lambda c: sin_estaciones(c, 884),
+            "70 % de las estaciones": lambda c: sin_estaciones(c, 530),  # pasaría con el umbral de 50 %, no con el de 80 %
+            "sin diésel ni kerosene": lambda c: [p.pop(k) for _, e in estaciones_crudas(c) for p in [e["precios"]] for k in ("DI", "KE") if k in p],
+        }
+        for nombre, rompe in casos.items():
+            with self.subTest(nombre):
+                self.reiniciar()
+                nuevo = con_generado(cargar_rx(), self.MAS_NUEVO)
+                rompe(nuevo)
+                d = self.bajar(nuevo)
+                self.assertEqual((d.fuente, len(d.estaciones), d.generado), ("respaldo", 1768, datetime(2026, 11, 1, 8, 30, 52)))
+                self.assertIn("incompleta", d.aviso)
+                self.assertIn("que viene con el proyecto", d.aviso)
+                self.sin_respaldo()
+
+    def test_el_motivo_distingue_estaciones_precios_y_registros(self):
+        ref = {"estaciones": bencina._referencia_inicial()["estaciones"]}
+        def validar(mod):
+            nuevo = con_generado(cargar_rx(), self.MAS_NUEVO)
+            mod(nuevo)
+            return bencina._validar_descarga(bencina.normalizar_rx(nuevo)[0], ref, bencina.FRACCION_MIN_RX)
+        self.assertIn("estaciones y la copia anterior tenía 1768", validar(lambda c: sin_estaciones(c, 530)))
+        self.assertIn("registros de precio y la copia anterior tenía 7802", validar(lambda c: [e["precios"].pop("DI", None) or e["precios"].pop("KE", None) for _, e in estaciones_crudas(c)]))
+        self.assertEqual(validar(lambda c: sin_estaciones(c, 100)), "")  # perder el 6 % de las estaciones es normal
+
+    def test_descarga_un_poco_menor_pero_razonable_se_acepta(self):
+        d = self.bajar(sin_estaciones(con_generado(cargar_rx(), self.MAS_NUEVO), 150))  # 91 % de las estaciones
+        self.assertEqual((d.fuente, len(d.estaciones)), ("rx", 1618))
+        self.assertTrue(bencina._ruta_respaldo().exists())
+
+    def test_descargas_defectuosas_dejan_los_datos_iniciales_y_no_crean_respaldo(self):
+        casos = {
+            "vacía": RespuestaFalsa(cuerpo=b""), "HTML": RespuestaFalsa(json_invalido=True),
+            "truncada": RespuestaFalsa(cuerpo=b'{"generado": "2026-11-02T08:30:52+00:00", "comunas": [{"comuna": "A"'),
+            "sin comunas": RespuestaFalsa(con_generado({"comunas": []}, self.MAS_NUEVO)),
+            "HTTP 500": RespuestaFalsa({"error": "x"}, status=500),
+        }
+        for nombre, respuesta in casos.items():
+            with self.subTest(nombre):
+                self.reiniciar()
+                d = self.bajar(respuesta)
+                self.assertEqual((d.fuente, len(d.estaciones)), ("respaldo", 1768))
+                self.sin_respaldo()
+        for exc in (requests.ConnectionError("sin red"), requests.Timeout()):
+            with self.subTest(type(exc).__name__), mock.patch("viajes.bencina.requests.get", side_effect=exc):
+                self.reiniciar()
+                self.assertEqual(len(bencina.obtener_datos(forzar=True).estaciones), 1768)
+                self.sin_respaldo()
+
+    def test_con_respaldo_persistente_la_referencia_es_el_respaldo(self):
+        self.assertEqual(self.bajar(con_generado(cargar_rx(), self.MAS_NUEVO)).fuente, "rx")  # crea el respaldo (generado 11-02)
+        antes = huella(bencina._ruta_respaldo())
+        self.reiniciar()
+        # más nuevo que los datos iniciales, pero más antiguo que el respaldo: se rechaza
+        d = self.bajar(sumar_a_precios(con_generado(cargar_rx(), "2026-11-02T01:00:00+00:00")))
+        self.assertEqual(d.fuente, "respaldo")
+        self.assertIn("que el guardado", d.aviso)
+        self.assertEqual(huella(bencina._ruta_respaldo()), antes)
+        # y la exigencia de datos completos también se mide contra el respaldo
+        self.reiniciar()
+        nuevo = sin_estaciones(con_generado(cargar_rx(), "2026-11-03T08:30:52+00:00"), 530)
+        d = self.bajar(nuevo, ahora=datetime(2026, 11, 3, 12))
+        self.assertEqual((d.fuente, len(d.estaciones)), ("respaldo", 1768))
+        self.assertIn("se conserva el guardado", d.aviso)
+        self.assertEqual(huella(bencina._ruta_respaldo()), antes)
+
+    def test_sin_datos_iniciales_ni_respaldo_la_primera_descarga_se_acepta(self):
+        with mock.patch("viajes.bencina.ARCHIVO_INICIAL", self.carpeta / "no-hay.json"):
+            d = self.bajar(sin_estaciones(cargar_rx(), 800))  # no hay con qué comparar: solo rigen las validaciones propias
+        self.assertEqual((d.fuente, len(d.estaciones)), ("rx", 968))
+
+    def test_datos_iniciales_danados_no_impiden_la_primera_descarga(self):
+        malo = self.carpeta / "malo.json"
+        malo.write_text("{ roto", encoding="utf-8")
+        with mock.patch("viajes.bencina.ARCHIVO_INICIAL", malo):
+            d = self.bajar(con_generado(cargar_rx(), self.MAS_NUEVO))
+        self.assertEqual((d.fuente, len(d.estaciones)), ("rx", 1768))
+
+    def reiniciar(self):
+        bencina.cache.clear()
+        bencina._memo.clear()
+
+
 class RxVistasTests(ConRx):
     """16: el mapa, los filtros y el recomendador reciben los mismos campos de siempre con los datos de RX Noticias."""
 
@@ -1272,7 +1413,8 @@ class RxVistasTests(ConRx):
 
     def test_sin_copia_y_sin_fuente_el_mapa_usa_los_datos_del_proyecto(self):
         self.get.side_effect = requests.ConnectionError("sin red")
-        j = self.pedir()
+        with self.con_inicial():
+            j = self.pedir()
         self.assertEqual((j["fuente"], len(j["estaciones"])), ("respaldo", 1768))
 
     def test_los_combustibles_extra_no_llegan_al_mapa(self):
