@@ -10,6 +10,7 @@
   var COLORES = { barato: "#16a34a", medio: "#f59e0b", caro: "#dc2626", sin: "#9ca3af" };
   var COMBUSTIBLES = ["93", "95", "97"];
   var MAX_LISTA = 15;
+  var DIAS_ANTIGUO = 30;  // desde cuántos días un precio se anota como antiguo en el texto de fuente (no se descarta)
 
   if (!cfg || !document.getElementById("mapa")) return;
   if (typeof L === "undefined") {
@@ -181,13 +182,21 @@
   }
 
   function dibujarFuente() {
-    var guardado = datos.fuente === "respaldo";  // la API no respondió: son los últimos datos descargados, no precios actuales
-    var t = "Fuente: Bencina en Línea (CNE)" + (guardado ? " · DATOS GUARDADOS, no son precios actuales" : "");
+    var guardado = datos.fuente === "respaldo";  // la fuente no respondió o no tiene datos nuevos: son los últimos datos guardados, no precios actuales
+    var heredada = datos.fuente === "api";  // ruta heredada (BENCINA_FUENTE=api): descarta los precios de más de max_dias días
+    var t = "Fuente: " + (heredada ? "Bencina en Línea (CNE)" : "RX Noticias (datos de la CNE)") + (guardado ? " · DATOS GUARDADOS, no son precios actuales" : "");
     if (datos.consultado) t += (guardado ? " · última descarga correcta " : " · consultado ") + new Date(datos.consultado).toLocaleString("es-CL");
     if (datos.fuente === "archivo") t += " · archivo local";
     var n = 0;
     Object.keys(datos.descartados || {}).forEach(function (k) { if (k.indexOf("precio") === 0) n += datos.descartados[k]; });
-    if (n) t += " · " + n + " precios no se usaron (de hace más de " + datos.max_dias + " días o inválidos)";
+    if (n) t += " · " + n + " precios no se usaron (" + (heredada ? "de hace más de " + datos.max_dias + " días o inválidos" : "valores inválidos o atípicos") + ")";
+    if (!heredada) {  // los precios antiguos no se descartan: se muestran con su fecha (en la lista y en el globo de cada estación)
+      var viejos = 0, limite = Date.now() - DIAS_ANTIGUO * 86400000;
+      datos.estaciones.forEach(function (e) {
+        Object.keys(e.precios || {}).forEach(function (c) { var f = Date.parse(e.precios[c].fecha); if (f < limite) viejos++; });
+      });
+      if (viejos) t += " · " + viejos + " precios tienen más de " + DIAS_ANTIGUO + " días y se muestran con su fecha";
+    }
     fuenteEl.textContent = t + ".";
     if (datos.aviso) {
       fuenteEl.appendChild(el("span", " ⚠ " + datos.aviso, "aviso"));
