@@ -158,6 +158,14 @@ def dec(x, d=1):
 
 
 # --- 3. Recomendación: costo/km = precio ÷ rendimiento; respeta el octanaje del fabricante ---
+def antiguedad_dias(fecha):
+    """Días desde la fecha de un precio (texto ISO) hasta hoy; None si no hay fecha o no se puede leer. Nunca negativo."""
+    f = bencina.parsear_fecha(fecha) if fecha else None
+    if f is None:
+        return None
+    return max((bencina.ahora() - f).days, 0)
+
+
 def recomendar_combustible(auto, km_mes, estaciones):
     """estaciones: lista en el formato de bencina.py (precios por combustible con fecha)."""
     opciones = []
@@ -167,11 +175,16 @@ def recomendar_combustible(auto, km_mes, estaciones):
         if ofertas:
             precio, _, est = min(ofertas, key=lambda o: (o[0], o[1]))
             costo_km = precio / auto["rendimiento"]
+            fecha = est["precios"][comb]["fecha"]
+            dias = antiguedad_dias(fecha)
             opciones.append({
                 "combustible": comb,
                 "precio": precio,
                 "estacion": f"{est['marca']} · {est['direccion']}, {est['comuna']}",
-                "fecha": est["precios"][comb]["fecha"],
+                "fecha": fecha,
+                # un precio sin fecha legible no se puede dar por vigente: se avisa igual que uno de más de MAX_DIAS días
+                "antiguo": dias is None or dias > bencina.MAX_DIAS,
+                "dias": dias,
                 "costo_km": costo_km,
                 "gasto_mes": costo_km * km_mes,
                 "cumple": auto["octanaje_recomendado"] is None or int(comb) >= auto["octanaje_recomendado"],
@@ -232,6 +245,17 @@ def recomendar_combustible(auto, km_mes, estaciones):
             f"el encendido para evitar detonación, lo que puede costar eficiencia y desgaste "
             f"a largo plazo. Por eso recomendamos el {recomendado['combustible']}."
         )
+    for o in opciones:
+        if not o["antiguo"]:
+            continue
+        cual = "El precio usado" if o is recomendado else f"El precio del {o['combustible']}"
+        if o["dias"] is None:
+            just.append(f"⚠ {cual} no trae una fecha válida, así que no se puede asegurar que esté vigente.")
+        else:
+            just.append(
+                f"⚠ {cual} es del {bencina.parsear_fecha(o['fecha']):%d-%m-%Y} (hace {o['dias']} días): "
+                "es antiguo y puede no ser el precio de hoy. Confírmalo en la estación."
+            )
     superiores = [o for o in opciones if int(o["combustible"]) > int(recomendado["combustible"])]
     if oct_rec is not None and superiores:
         just.append(
@@ -345,6 +369,7 @@ def estaciones_json(request):
         "regiones": sorted({e["region"] for e in datos.estaciones if e["region"]}, key=orden),
         "comunas": [{"nombre": c, "region": r} for c, r in pares],
         "fuente": datos.fuente,
+        "inicial": datos.inicial,
         "completa": datos.completa,
         "consultado": datos.consultado.isoformat() if datos.consultado else None,
         "aviso": datos.aviso,

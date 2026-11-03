@@ -5,7 +5,7 @@ from django.test import Client
 
 from viajes import bencina, views
 
-from .base import ConCache, api_falsa, cargar_muestra
+from .base import ConCache, ConRx, api_falsa, cargar_muestra
 
 
 def estaciones_muestra():
@@ -437,3 +437,113 @@ class RespaldoEnArchivoTests(ConCache):
                 d = bencina.obtener_datos()
             self.assertEqual(d.fuente, "respaldo")
             self.assertTrue(d.ok)
+
+
+# ---------- revisión final: precios antiguos y avisos ----------
+def estacion_con_fecha(id_, fecha, precio=1300.0, comb="93"):
+    return {"id": id_, "marca": "Copec", "region": "R", "comuna": "Santiago", "direccion": "Calle 1", "lat": None, "lon": None,
+            "precios": {comb: {"precio": precio, "fecha": fecha, "atencion": ""}}}
+
+
+class PrecioAntiguoTests(ConCache):
+    """El reloj de ConCache está en el 27-oct-2026 12:00; MAX_DIAS = 30."""
+
+    def recomendar(self, fecha, octanaje=None):
+        return views.recomendar_combustible(auto(15.0, octanaje), 1000, [estacion_con_fecha(1, fecha)])
+
+    def test_un_precio_reciente_no_se_marca_como_antiguo(self):
+        r = self.recomendar("2026-10-25")
+        self.assertFalse(r["recomendado"]["antiguo"])
+        self.assertFalse(any("antiguo" in j for j in r["justificacion"]))
+
+    def test_limite_de_30_dias(self):
+        self.assertFalse(self.recomendar("2026-09-27")["recomendado"]["antiguo"])  # hace 30 días
+        self.assertTrue(self.recomendar("2026-09-26")["recomendado"]["antiguo"])  # hace 31 días
+
+    def test_un_precio_antiguo_se_advierte_con_su_fecha_y_no_cambia_el_calculo(self):
+        r = self.recomendar("2026-08-01")
+        rec = r["recomendado"]
+        self.assertTrue(rec["antiguo"])
+        self.assertEqual(rec["dias"], 87)
+        texto = " ".join(r["justificacion"])
+        self.assertIn("01-08-2026", texto)
+        self.assertIn("hace 87 días", texto)
+        self.assertAlmostEqual(rec["costo_km"], 1300 / 15.0)  # solo se advierte: el cálculo y la elección son los mismos
+        self.assertAlmostEqual(rec["gasto_mes"], 1300 / 15.0 * 1000)
+
+    def test_sin_fecha_o_con_fecha_ilegible_no_se_da_por_vigente(self):
+        for fecha in (None, "", "no es una fecha"):
+            with self.subTest(fecha):
+                r = self.recomendar(fecha)
+                self.assertTrue(r["recomendado"]["antiguo"])
+                self.assertIsNone(r["recomendado"]["dias"])
+                self.assertTrue(any("no trae una fecha válida" in j for j in r["justificacion"]))
+
+    def test_una_fecha_futura_no_da_dias_negativos(self):
+        self.assertEqual(self.recomendar("2026-12-01")["recomendado"]["dias"], 0)
+
+    def test_se_advierte_tambien_una_opcion_antigua_que_no_es_la_recomendada(self):
+        estaciones = [estacion_con_fecha(1, "2026-10-25", 1300.0, "93"), estacion_con_fecha(2, "2026-06-01", 1400.0, "97")]
+        r = views.recomendar_combustible(auto(15.0, 97), 1000, estaciones)
+        self.assertEqual(r["recomendado"]["combustible"], "97")
+        self.assertTrue(r["recomendado"]["antiguo"])
+        self.assertFalse([o for o in r["opciones"] if o["combustible"] == "93"][0]["antiguo"])
+        self.assertTrue(any("El precio usado es del 01-06-2026" in j for j in r["justificacion"]))
+
+    def test_la_pagina_muestra_el_aviso_y_la_fecha_del_precio_antiguo(self):
+        datos = bencina.Datos([estacion_con_fecha(1, "2026-08-01")], "api", bencina.ahora(), "", {})
+        with mock.patch("viajes.bencina.obtener_datos", return_value=datos):
+            r = Client().post("/", {"accion": "recomendar", "vehiculo": "Kia Soluto 1.4", "km_mes": "1000"})
+        self.assertContains(r, "precio antiguo")
+        self.assertContains(r, "2026-08-01")
+        self.assertContains(r, "hace 87 días")
+
+    def test_la_pagina_no_marca_un_precio_reciente(self):
+        datos = bencina.Datos([estacion_con_fecha(1, "2026-10-26")], "api", bencina.ahora(), "", {})
+        with mock.patch("viajes.bencina.obtener_datos", return_value=datos):
+            r = Client().post("/", {"accion": "recomendar", "vehiculo": "Kia Soluto 1.4", "km_mes": "1000"})
+        self.assertNotContains(r, "precio antiguo")
+
+
+class AvisosDeOctanajeTests(ConCache):
+    def pagina(self, vehiculo, estaciones):
+        datos = bencina.Datos(estaciones, "api", bencina.ahora(), "", {})
+        with mock.patch("viajes.bencina.obtener_datos", return_value=datos):
+            return Client().post("/", {"accion": "recomendar", "vehiculo": vehiculo, "km_mes": "1000"})
+
+    def test_octanaje_sin_verificar_se_avisa_de_forma_visible(self):
+        # un auto real del catálogo sin octanaje verificado: el aviso no depende de la lista «¿Por qué?»
+        sin_verificar = next(a["nombre"] for a in views.catalogo.values() if a["octanaje_recomendado"] is None)
+        r = self.pagina(sin_verificar, [estacion_con_fecha(1, "2026-10-26")])
+        self.assertContains(r, "Octanaje del fabricante sin verificar")
+
+    def test_octanaje_verificado_no_muestra_el_aviso_de_sin_verificar(self):
+        r = self.pagina("Kia Soluto 1.4", [estacion_con_fecha(1, "2026-10-26")])
+        self.assertNotContains(r, "Octanaje del fabricante sin verificar")
+
+    def test_si_ningun_precio_cumple_el_octanaje_la_recomendada_queda_marcada(self):
+        # auto que pide 97 y una sola estación con 93: ninguna opción cumple, se muestra la más barata sin decir que cumple
+        r = views.recomendar_combustible(auto(15.0, 97), 1000, [estacion_con_fecha(1, "2026-10-26", 1300.0, "93")])
+        self.assertFalse(r["recomendado"]["cumple"])
+        self.assertFalse(any("cumple el octanaje" in j for j in r["justificacion"]))
+
+
+class DatosInicialesEnLaPaginaTests(ConRx):
+    def test_con_los_datos_del_proyecto_no_dice_consultado_ni_descarga_correcta(self):
+        with self.con_inicial(), mock.patch("viajes.bencina.requests.get", side_effect=requests.ConnectionError("sin red")):
+            r = Client().post("/", {"accion": "recomendar", "vehiculo": "Kia Soluto 1.4", "km_mes": "1000"})
+            j = Client().get("/estaciones.json").json()
+        self.assertContains(r, "Datos guardados, no son precios actuales")
+        self.assertContains(r, "vienen con el proyecto")
+        self.assertNotContains(r, "la última descarga correcta")
+        self.assertNotContains(r, ", consultado ")
+        self.assertTrue(j["inicial"])
+        self.assertEqual(j["fuente"], "respaldo")
+
+    def test_con_una_descarga_valida_inicial_es_falso(self):
+        from .base import cargar_rx, rx_falsa
+        contenido = cargar_rx()
+        contenido["generado"] = "2026-11-01T11:00:00+00:00"
+        with self.con_inicial(), mock.patch("viajes.bencina.requests.get", side_effect=rx_falsa(contenido)):
+            j = Client().get("/estaciones.json").json()
+        self.assertFalse(j["inicial"])
