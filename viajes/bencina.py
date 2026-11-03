@@ -91,6 +91,7 @@ class Datos:
     consultado: object = None  # datetime (UTC) de la consulta a la fuente
     aviso: str = ""
     descartados: dict = field(default_factory=dict)
+    inicial: bool = False  # True: son los datos que vienen con el proyecto (combustible_inicial.json), no una descarga
     completa: bool = True  # False: una parte (p. ej. las marcas) no se pudo actualizar y se reutilizó de la copia anterior
     generado: object = None  # datetime (UTC) en que la fuente generó el archivo (RX Noticias); no es la fecha de los precios
 
@@ -604,8 +605,10 @@ def _descargar():
 def _desde_archivo(ruta):
     with open(ruta, encoding="utf-8") as f:
         contenido = json.load(f)
+    if not isinstance(contenido, dict):  # una lista, null o un número no son ninguno de los dos formatos
+        raise ValueError("el JSON no es un objeto con estaciones")
     generado = None
-    if isinstance(contenido, dict) and "comunas" in contenido:  # formato de combustible.json (RX Noticias)
+    if "comunas" in contenido:  # formato de combustible.json (RX Noticias)
         estaciones, descartados, generado = normalizar_rx(contenido)
     else:
         estaciones, descartados = normalizar_respuesta(contenido.get("estaciones"), contenido.get("marcas"))
@@ -633,6 +636,25 @@ def _ruta_respaldo(previo=False):
     return CARPETA_RESPALDO / ("respaldo.previo.json" if previo else "respaldo.json")
 
 
+def _es_numero(valor):
+    return isinstance(valor, (int, float)) and not isinstance(valor, bool) and math.isfinite(valor)
+
+
+def _estacion_usable(e):
+    """True si una estación del respaldo trae todo lo que usan el mapa y el recomendador (no solo `id` y `precios`).
+    Un JSON válido pero con estaciones incompletas provocaba un error 500 al usarlo."""
+    if not isinstance(e, dict) or not isinstance(e.get("precios"), dict):
+        return False
+    if not all(isinstance(e.get(k), str) for k in ("marca", "region", "comuna", "direccion")):
+        return False
+    if not all(e.get(k) is None or _es_numero(e[k]) for k in ("lat", "lon")):
+        return False
+    return all(
+        isinstance(p, dict) and _es_numero(p.get("precio")) and (p.get("fecha") is None or isinstance(p["fecha"], str))
+        for p in e["precios"].values()
+    )
+
+
 def _cargar_respaldo(ruta):
     """Documento del respaldo o None si no existe o no es válido. Nunca borra ni modifica el archivo."""
     try:
@@ -645,7 +667,7 @@ def _cargar_respaldo(ruta):
         ok = (
             isinstance(doc, dict) and doc.get("version") == VERSION_RESPALDO
             and isinstance(doc.get("estaciones"), list) and doc["estaciones"]
-            and all(isinstance(e, dict) and "id" in e and isinstance(e.get("precios"), dict) for e in doc["estaciones"])
+            and all(_estacion_usable(e) and "id" in e for e in doc["estaciones"])
         )
         if ok:
             datetime.fromisoformat(doc["descargado"])
@@ -934,7 +956,7 @@ def _datos_iniciales():
     except ValueError as e:
         log.warning("Los datos iniciales del proyecto no se pudieron usar: %s", _sin_credenciales(e))
         return None
-    return Datos(estaciones, "respaldo", generado, "", descartados, generado=generado)
+    return Datos(estaciones, "respaldo", generado, "", descartados, generado=generado, inicial=True)
 
 
 # ---------- filtros ----------

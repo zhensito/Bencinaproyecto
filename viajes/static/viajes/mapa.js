@@ -185,7 +185,7 @@
     var guardado = datos.fuente === "respaldo";  // la fuente no respondió o no tiene datos nuevos: son los últimos datos guardados, no precios actuales
     var heredada = datos.fuente === "api";  // ruta heredada (BENCINA_FUENTE=api): descarta los precios de más de max_dias días
     var t = "Fuente: " + (heredada ? "Bencina en Línea (CNE)" : "RX Noticias (datos de la CNE)") + (guardado ? " · DATOS GUARDADOS, no son precios actuales" : "");
-    if (datos.consultado) t += (guardado ? " · última descarga correcta " : " · consultado ") + new Date(datos.consultado).toLocaleString("es-CL");
+    if (datos.consultado) t += (datos.inicial ? " · archivo incluido en el proyecto, generado " : guardado ? " · última descarga correcta " : " · consultado ") + new Date(datos.consultado).toLocaleString("es-CL");
     if (datos.fuente === "archivo") t += " · archivo local";
     var n = 0;
     Object.keys(datos.descartados || {}).forEach(function (k) { if (k.indexOf("precio") === 0) n += datos.descartados[k]; });

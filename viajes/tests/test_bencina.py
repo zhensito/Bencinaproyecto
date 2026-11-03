@@ -1549,3 +1549,86 @@ class NominatimTests(ConRx):
                 self.assertIsNone(bencina._geocodificar(est))
         with mock.patch("viajes.bencina.requests.get", return_value=RespuestaFalsa([base])):
             self.assertEqual(bencina._geocodificar(est), (-33.43, -70.61))
+
+
+# ---------- revisión final: archivos válidos como JSON pero con la estructura dañada ----------
+EST_BUENA = {"id": "x1", "marca": "Copec", "region": "Región Metropolitana", "comuna": "Santiago", "direccion": "Calle 1",
+             "lat": -33.4, "lon": -70.6, "precios": {"93": {"precio": 1300.0, "fecha": "2026-10-30", "atencion": ""}}}
+
+
+class RespaldoIncompletoTests(ConRx):
+    """Un respaldo con JSON válido y `version` correcta pero con estaciones incompletas daba error 500 en el mapa o en el
+    recomendador (KeyError: 'comuna' / 'precio'). Ahora se trata como no utilizable, igual que uno corrupto."""
+
+    DANADAS = {
+        "solo id y precios": {"id": "x", "precios": {}},
+        "sin comuna": {k: v for k, v in EST_BUENA.items() if k != "comuna"},
+        "precio sin valor": dict(EST_BUENA, precios={"93": {"fecha": "2026-10-30"}}),
+        "precio en texto": dict(EST_BUENA, precios={"93": {"precio": "caro", "fecha": "2026-10-30"}}),
+        "precio NaN": dict(EST_BUENA, precios={"93": {"precio": float("nan"), "fecha": None}}),
+        "precio booleano": dict(EST_BUENA, precios={"93": {"precio": True, "fecha": None}}),
+        "fecha numérica": dict(EST_BUENA, precios={"93": {"precio": 1300.0, "fecha": 5}}),
+        "coordenada en texto": dict(EST_BUENA, lat="a", lon="b"),
+        "marca nula": dict(EST_BUENA, marca=None),
+        "la estación no es un objeto": "texto",
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.client = Client()
+
+    def escribir(self, estaciones, previo=False):
+        doc = {"version": bencina.VERSION_RESPALDO, "descargado": "2026-10-30T10:00:00+00:00", "estaciones": estaciones}
+        ruta = bencina._ruta_respaldo(previo=previo)
+        ruta.write_text(json.dumps(doc), encoding="utf-8")
+        bencina._memo.clear()
+        return ruta
+
+    def sin_red(self):
+        return mock.patch("viajes.bencina.requests.get", side_effect=requests.ConnectionError("sin red"))
+
+    def test_estaciones_incompletas_no_se_usan_ni_dan_500_y_el_archivo_no_se_toca(self):
+        for nombre, est in self.DANADAS.items():
+            with self.subTest(nombre):
+                ruta = self.escribir([EST_BUENA, est])
+                antes = ruta.read_bytes()
+                with self.con_inicial(), self.sin_red():
+                    bencina.cache.clear()  # sin el bloqueo de reintento del subcaso anterior
+                    d = bencina.obtener_datos()
+                    mapa = self.client.get("/estaciones.json")
+                    pagina = self.client.post("/", {"accion": "recomendar", "vehiculo": "Kia Soluto 1.4", "km_mes": "1000"})
+                self.assertEqual((d.fuente, d.inicial, len(d.estaciones)), ("respaldo", True, 1768))  # cae en los datos del proyecto
+                self.assertEqual((mapa.status_code, pagina.status_code), (200, 200))
+                self.assertNotContains(pagina, "No hay precios guardados")
+                self.assertEqual(ruta.read_bytes(), antes)  # y no se borró ni se modificó
+                bencina.cache.clear()
+
+    def test_un_respaldo_incompleto_usa_la_copia_previa_valida(self):
+        self.escribir([EST_BUENA, self.DANADAS["sin comuna"]])
+        self.escribir([EST_BUENA], previo=True)
+        with self.con_inicial(), self.sin_red():
+            d = bencina.obtener_datos()
+        self.assertEqual((d.fuente, d.inicial, [e["id"] for e in d.estaciones]), ("respaldo", False, ["x1"]))
+
+    def test_un_respaldo_completo_sigue_funcionando(self):
+        self.escribir([EST_BUENA, dict(EST_BUENA, id="x2", lat=None, lon=None, precios={})])
+        with self.sin_red():
+            d = bencina.obtener_datos()
+            pagina = self.client.post("/", {"accion": "recomendar", "vehiculo": "Kia Soluto 1.4", "km_mes": "1000"})
+        self.assertEqual((d.fuente, len(d.estaciones)), ("respaldo", 2))
+        self.assertContains(pagina, "$1.300/L")
+
+
+class ArchivoLocalInvalidoTests(ConCache):
+    def test_json_que_no_es_un_objeto_o_con_estructura_rara_no_lanza_errores(self):
+        casos = {"lista": [], "null": None, "número": 3, "comunas en texto": {"comunas": "x"},
+                 "estaciones en número": {"estaciones": 5}, "estaciones en texto": {"estaciones": ["a"]}}
+        for nombre, contenido in casos.items():
+            with self.subTest(nombre):
+                ruta = self.carpeta / "local.json"
+                ruta.write_text(json.dumps(contenido), encoding="utf-8")
+                with mock.patch("viajes.bencina.ARCHIVO_LOCAL", str(ruta)):
+                    d = bencina.obtener_datos()
+                    r = Client().get("/estaciones.json")
+                self.assertFalse(d.ok)
+                self.assertEqual(r.status_code, 503)

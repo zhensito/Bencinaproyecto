@@ -114,7 +114,7 @@
                     <button type="submit" class="btn-verde">Recomendar combustible <svg class="icono" aria-hidden="true"><use href="#i-arrow-right"/></svg></button>
                     <p class="nota">
                         <svg class="icono" aria-hidden="true"><use href="#i-info"/></svg>
-                        <span>Precios reales de Bencina en Línea (CNE). Los rendimientos de cada auto indican su fuente y algunos no están verificados.</span>
+                        <span>Precios de la CNE (Bencina en Línea), recopilados por RX Noticias; cada precio muestra su fecha. Los rendimientos de cada auto indican su fuente y algunos no están verificados.</span>
                     </p>
                 </form>
             </div>
@@ -135,11 +135,13 @@
                     <div class="pastilla-comb"><svg class="icono" aria-hidden="true"><use href="#i-fuel"/></svg><h3>{{ resultado.recomendado.combustible }}</h3></div>
                     <p class="cifras"><span><strong>{{ resultado.recomendado.costo_km_txt }}</strong> por km</span> <span><strong>{{ resultado.recomendado.gasto_txt }}</strong> al mes</span></p>
 
+                    {% if resultado.oct_rec is None %}<p class="aviso-resultado">⚠ Octanaje del fabricante sin verificar: es el combustible más barato, no una compatibilidad confirmada. Revisa el manual del vehículo.</p>{% endif %}
+
                     <hr class="separador">
 
                     <p class="mini-titulo"><svg class="icono" aria-hidden="true"><use href="#i-map-pin"/></svg>Estación más barata en {{ resultado.ambito }}</p>
                     <p class="estacion-barata"><strong>{{ resultado.recomendado.precio_txt }}/L</strong> · {{ resultado.recomendado.estacion }}</p>
-                    <p class="fecha-precio">Precio informado: {{ resultado.recomendado.fecha_txt }}</p>
+                    <p class="fecha-precio">Precio informado: {{ resultado.recomendado.fecha_txt }}{% if resultado.recomendado.antiguo %} · <strong>⚠ precio antiguo</strong>{% endif %}</p>
 
                     <div class="porque">
                         <p class="mini-titulo"><svg class="icono" aria-hidden="true"><use href="#i-lightbulb"/></svg>¿Por qué este combustible?</p>
@@ -155,7 +157,7 @@
                                 <li>
                                     <span class="oc-comb">{{ o.combustible }}</span>
                                     <span class="oc-datos">{{ o.costo_km_txt }}/km · {{ o.gasto_txt }}/mes · {{ o.precio_txt }}/L</span>
-                                    {% if o.es_recomendado %}<span class="ok">✓ recomendado</span>{% elif not o.cumple %}<span class="no-cumple">(bajo el octanaje recomendado: {{ resultado.oct_rec }})</span>{% endif %}
+                                    {% if o.es_recomendado %}<span class="ok">✓ recomendado</span>{% if not o.cumple %} <span class="no-cumple">(bajo el octanaje recomendado: {{ resultado.oct_rec }})</span>{% endif %}{% elif not o.cumple %}<span class="no-cumple">(bajo el octanaje recomendado: {{ resultado.oct_rec }})</span>{% endif %}
                                 </li>
                             {% endfor %}
                         </ul>
@@ -163,9 +165,9 @@
 
                     <p class="fuente-resultado">
                         <svg class="icono" aria-hidden="true"><use href="#i-info"/></svg>
-                        <span>Precios de {{ resultado.n_estaciones }} estaciones · {% if precios.generado %}RX Noticias (CC BY 4.0), con datos de Bencina en Línea (CNE), archivo generado el {{ precios.generado|date:"d-m-Y H:i" }} UTC{% else %}Bencina en Línea (CNE){% endif %}{% if precios.consultado %}, consultado {{ precios.consultado|date:"d-m-Y H:i" }} UTC{% endif %}.</span>
+                        <span>Precios de {{ resultado.n_estaciones }} estaciones · {% if precios.generado %}RX Noticias (CC BY 4.0), con datos de Bencina en Línea (CNE), archivo generado el {{ precios.generado|date:"d-m-Y H:i" }} UTC{% else %}Bencina en Línea (CNE){% endif %}{% if precios.consultado and not precios.inicial %}, consultado {{ precios.consultado|date:"d-m-Y H:i" }} UTC{% endif %}.</span>
                     </p>
-                    {% if precios.fuente == "respaldo" %}<p class="aviso-resultado"><strong>⚠ Datos guardados, no son precios actuales:</strong> la última descarga correcta fue el {{ precios.consultado|date:"d-m-Y H:i" }} UTC.</p>{% endif %}
+                    {% if precios.fuente == "respaldo" %}<p class="aviso-resultado"><strong>⚠ Datos guardados, no son precios actuales:</strong> {% if precios.inicial %}son los que vienen con el proyecto (archivo generado el {{ precios.consultado|date:"d-m-Y H:i" }} UTC) y todavía no hay una descarga nueva.{% else %}la última descarga correcta fue el {{ precios.consultado|date:"d-m-Y H:i" }} UTC.{% endif %}</p>{% endif %}
                     {% if precios.aviso %}<p class="aviso-resultado">⚠ {{ precios.aviso }}</p>{% endif %}
                     {% if precios.n_precios_descartados %}<p class="nota-resultado">{{ precios.n_precios_descartados }} precios de la fuente no se usaron ({% if precios.generado %}valores inválidos o atípicos{% else %}de hace más de {{ max_dias }} días o con valores inválidos{% endif %}).</p>{% endif %}
                 {% else %}
@@ -287,7 +289,7 @@
                         <p class="formula">Costo por km = precio por litro ÷ rendimiento</p>
                         <p class="formula">Gasto mensual = costo por km × km al mes</p>
                     </div>
-                    <p class="nota-calculo">Recomendamos el más barato que cumple el octanaje que pide el fabricante de tu auto.</p>
+                    <p class="nota-calculo">Recomendamos el más barato que cumple el octanaje del fabricante cuando está verificado; si no lo está, el más barato, y lo avisamos.</p>
                 </div>
                 <div class="tarjeta">
                     <div class="cabecera-tarjeta">
