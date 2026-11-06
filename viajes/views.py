@@ -1,4 +1,5 @@
 import csv
+import re
 import unicodedata
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -50,10 +51,24 @@ COMBUSTIBLES = ["93", "95", "97"]
 
 
 # --- 2. Auxiliares ---
+# Parte entera con puntos de miles en formato chileno: «1.200», «12.500», «1.200.000» (1 a 3 dígitos sin cero inicial, y grupos de 3).
+MILES_CHILENOS = re.compile(r"[+-]?[1-9][0-9]{0,2}(\.[0-9]{3})+")
+
+
 def a_numero(texto):
-    """Texto a número (acepta coma); None si no es válido."""
+    """Texto a número en formato chileno; None si no es válido.
+
+    - El punto es separador de miles cuando agrupa de a tres dígitos: «1.200» → 1200, «12.500» → 12500, «1.350,5» → 1350,5.
+    - La coma es siempre el separador decimal: «0,5» → 0,5 y también «1,200» → 1,2 (no 1200). Es lo habitual en Chile
+      y evita adivinar; quien quiera 1200 puede escribir «1200» o «1.200».
+    - Un punto que no agrupa de a tres sigue siendo decimal: «40.5» → 40,5, «0.500» → 0,5, «1.25» → 1,25.
+    """
+    t = str(texto).strip()
+    entero, coma, decimales = t.partition(",")
+    if MILES_CHILENOS.fullmatch(entero):
+        t = entero.replace(".", "") + coma + decimales
     try:
-        n = float(str(texto).strip().replace(",", "."))
+        n = float(t.replace(",", "."))
     except ValueError:
         return None
     if n != n or n in (float("inf"), float("-inf")):

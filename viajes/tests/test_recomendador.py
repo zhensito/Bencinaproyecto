@@ -547,3 +547,68 @@ class DatosInicialesEnLaPaginaTests(ConRx):
         with self.con_inicial(), mock.patch("viajes.bencina.requests.get", side_effect=rx_falsa(contenido)):
             j = Client().get("/estaciones.json").json()
         self.assertFalse(j["inicial"])
+
+
+class NumerosChilenosTests(ConCache):
+    """El punto agrupa miles («1.200» = 1200) y la coma es el decimal («0,5» = 0,5), como se escribe en Chile."""
+
+    def test_a_numero_miles_y_decimales(self):
+        casos = {
+            "1200": 1200, "1.200": 1200, "12.500": 12500, "1.350": 1350, "1.200.000": 1200000, "+1.200": 1200,
+            "1.350,5": 1350.5, "1.000,25": 1000.25, "0,5": 0.5, "800,5": 800.5, "40,55": 40.55,
+            "40.5": 40.5, "1.25": 1.25, "0.500": 0.5, "1349.9": 1349.9, "  1.200  ": 1200, "-1.200": -1200,
+        }
+        for texto, esperado in casos.items():
+            self.assertEqual(views.a_numero(texto), esperado, texto)
+
+    def test_a_numero_coma_con_tres_digitos_es_decimal(self):
+        # Decisión: la coma siempre es decimal («1,200» = 1,2), nunca separador de miles.
+        self.assertEqual(views.a_numero("1,200"), 1.2)
+        self.assertEqual(views.a_numero("1,350"), 1.35)
+
+    def test_a_numero_invalidos(self):
+        for texto in ["", "   ", "abc", "nan", "inf", "-inf", "1e999", "$1.350", "1 200", "1.200,5.5", "1,200,5", "1.35.5", "1.200.00", None]:
+            self.assertIsNone(views.a_numero(texto), repr(texto))
+
+    def recomendar(self, km):
+        with mock.patch("viajes.bencina.requests.get", side_effect=api_falsa()):
+            return self.client.post("/", {"accion": "recomendar", "vehiculo": "Kia Soluto 1.4", "km_mes": km, "comuna": ""})
+
+    def setUp(self):
+        super().setUp()
+        self.client = Client()
+
+    def test_km_con_punto_de_miles_da_lo_mismo_que_sin_punto(self):
+        sin = self.recomendar("1200").context["resultado"]["recomendado"]["gasto_txt"]
+        con = self.recomendar("1.200").context["resultado"]["recomendado"]["gasto_txt"]
+        self.assertEqual(con, sin)
+        self.assertEqual(self.recomendar("12.500").context["resultado"]["recomendado"]["gasto_mes"],
+                         self.recomendar("12500").context["resultado"]["recomendado"]["gasto_mes"])
+
+    def test_km_sobre_el_maximo_se_rechaza(self):
+        for km in ("30.001", "1.200.000"):
+            r = self.recomendar(km)
+            self.assertIsNone(r.context.get("resultado"), km)
+            self.assertContains(r, "hasta 30000")
+        self.assertIsNotNone(self.recomendar("30.000").context.get("resultado"))
+
+    def test_repostaje_con_miles(self):
+        def rep(l, p):
+            return self.client.post("/", {"accion": "repostaje", "litros": l, "precio_litro": p})
+
+        r = rep("40", "1.350")
+        self.assertContains(r, "$54.000")
+        self.assertContains(r, "40 L × $1.350/L")
+        self.assertContains(rep("40", "1.350,5"), "$54.020")  # 40 × 1350,5 = 54020
+        self.assertContains(rep("0,5", "1.350"), "$675")
+        self.assertContains(rep("500", "10.000"), "$5.000.000")  # en el límite
+
+    def test_litros_con_miles_se_rechazan_por_el_maximo(self):
+        # «1.000» litros es 1000 (no 1) y supera el máximo de 500.
+        for litros in ("1.000", "40.500"):
+            r = self.client.post("/", {"accion": "repostaje", "litros": litros, "precio_litro": "1350"})
+            self.assertIsNone(r.context.get("repostaje"), litros)
+            self.assertContains(r, "hasta 500")
+        r = self.client.post("/", {"accion": "repostaje", "litros": "40", "precio_litro": "10.001"})
+        self.assertIsNone(r.context.get("repostaje"))
+        self.assertContains(r, "hasta 10000")
